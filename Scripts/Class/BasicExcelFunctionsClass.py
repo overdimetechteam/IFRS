@@ -613,5 +613,3 @@ class ExcelPortfolioAutomation:
             print(f"    No pivot tables found in workbook")
 
         return pivot_tables_dict
-
-
