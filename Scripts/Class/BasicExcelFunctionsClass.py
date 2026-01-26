@@ -446,4 +446,172 @@ class ExcelPortfolioAutomation:
             print(f"    Error updating pivot table source: {e}")
             raise
 
+    def read_sheet_range_to_dataframe(self, sheet_name: str, range_address: str = None) -> pd.DataFrame:
+        """
+        Read data from a specific range in a sheet to a pandas DataFrame
+        If range_address is None, reads the entire used range
+
+        Args:
+            sheet_name: Name of the worksheet to read from
+            range_address: Range to read (e.g., 'A1:Z100'). If None, reads used range
+
+        Returns:
+            pd.DataFrame: DataFrame containing the data from the range
+        """
+        print(f"   Reading data from sheet '{sheet_name}'...")
+
+        sheet = self.workbook.sheets[sheet_name]
+
+        if range_address:
+            # Read specific range
+            data = sheet.range(range_address).value
+            print(f"    Read range {range_address}")
+        else:
+            # Read entire used range
+            used_range = sheet.used_range
+            data = used_range.value
+            range_address = used_range.address
+            print(f"    Read used range {range_address}")
+
+        # Convert to DataFrame
+        if data:
+            # If data is a list of lists, convert to DataFrame
+            if isinstance(data, list) and len(data) > 0:
+                # Use first row as headers
+                df = pd.DataFrame(data[1:], columns=data[0])
+            else:
+                # Single cell value
+                df = pd.DataFrame([data])
+
+            print(f"    Successfully read {len(df)} rows and {len(df.columns)} columns")
+            return df
+        else:
+            print(f"    No data found in range")
+            return pd.DataFrame()
+
+    def write_dataframe_to_sheet(self, sheet_name: str, start_cell: str, df: pd.DataFrame,
+                                  include_headers: bool = True, clear_existing: bool = False) -> None:
+        """
+        Write a pandas DataFrame to a specific location in a sheet
+
+        Args:
+            sheet_name: Name of the worksheet to write to
+            start_cell: Starting cell for writing (e.g., 'A1')
+            df: DataFrame to write
+            include_headers: Whether to include column headers (default: True)
+            clear_existing: Whether to clear existing data in the target range (default: False)
+        """
+        print(f"   Writing DataFrame to sheet '{sheet_name}' starting at {start_cell}...")
+
+        sheet = self.workbook.sheets[sheet_name]
+
+        # Prepare data
+        if include_headers:
+            # Include headers
+            data = [df.columns.tolist()] + df.values.tolist()
+        else:
+            # Data only
+            data = df.values.tolist()
+
+        # Calculate target range if we need to clear
+        if clear_existing and data:
+            num_rows = len(data)
+            num_cols = len(data[0]) if data else 0
+
+            # Calculate end cell by offsetting from start cell
+            end_cell = sheet.range(start_cell).offset(num_rows - 1, num_cols - 1)
+            end_cell_address = end_cell.get_address(False, False)
+
+            # Clear the range
+            clear_range = f"{start_cell}:{end_cell_address}"
+            print(f"   Clearing existing data in range {clear_range}...")
+            sheet.range(clear_range).clear_contents()
+
+        # Write data
+        if data:
+            sheet.range(start_cell).value = data
+            print(f"    Successfully wrote {len(df)} rows and {len(df.columns)} columns")
+        else:
+            print(f"    No data to write")
+
+    def delete_rows_after_last_data(self, sheet_name: str, check_column: str = 'A',
+                                     start_row: int = 2, max_delete_rows: int = 1000000) -> None:
+        """
+        Delete all empty rows after the last row with data in a sheet
+        This helps clean up sheets that have extra empty rows extending the used range
+
+        Args:
+            sheet_name: Name of the worksheet to clean up
+            check_column: Column to check for last data (default: 'A')
+            start_row: Row to start checking from (default: 2, to preserve headers)
+            max_delete_rows: Maximum number of rows to delete in one go (default: 1000000)
+        """
+        print(f"   Deleting extra rows after last data in sheet '{sheet_name}'...")
+
+        sheet = self.workbook.sheets[sheet_name]
+
+        try:
+            # Find the last row with data in the check column
+            last_row_with_data = sheet.range(f'{check_column}{start_row}').end('down').row
+
+            # Handle case where end('down') goes to the very last row
+            if last_row_with_data > 1048576 or last_row_with_data < start_row:
+                last_row_with_data = start_row
+                print(f"   No data found below row {start_row}")
+                return
+
+            print(f"   Last row with data: {last_row_with_data}")
+
+            # Find the actual used range last row
+            used_range_last_row = sheet.used_range.last_cell.row
+
+            if used_range_last_row > last_row_with_data:
+                # Calculate how many rows to delete
+                rows_to_delete = min(used_range_last_row - last_row_with_data, max_delete_rows)
+                start_delete_row = last_row_with_data + 1
+
+                print(f"   Deleting {rows_to_delete} empty rows starting from row {start_delete_row}...")
+
+                # Delete the entire rows
+                end_delete_row = start_delete_row + rows_to_delete - 1
+                sheet.range(f'{start_delete_row}:{end_delete_row}').api.EntireRow.Delete()
+
+                print(f"    Successfully deleted {rows_to_delete} empty rows")
+            else:
+                print(f"   No extra rows to delete (last data row matches used range)")
+
+        except Exception as e:
+            print(f"    Error deleting extra rows: {e}")
+            raise
+
+    def find_all_pivot_tables(self) -> dict:
+        """
+        Find all pivot tables in the entire workbook
+
+        Returns:
+            Dictionary with sheet names as keys and list of pivot table names as values
+        """
+        print(f"   Searching for all pivot tables in workbook...")
+
+        pivot_tables_dict = {}
+
+        for sheet in self.workbook.sheets:
+            sheet_name = sheet.name
+            try:
+                pivot_tables = sheet.api.PivotTables()
+                if pivot_tables.Count > 0:
+                    pivot_list = []
+                    for i in range(1, pivot_tables.Count + 1):
+                        pivot_list.append(pivot_tables(i).Name)
+                    pivot_tables_dict[sheet_name] = pivot_list
+                    print(f"    Found {pivot_tables.Count} pivot table(s) in sheet '{sheet_name}': {pivot_list}")
+            except Exception as e:
+                # Sheet might not support pivot tables
+                pass
+
+        if not pivot_tables_dict:
+            print(f"    No pivot tables found in workbook")
+
+        return pivot_tables_dict
+
 
