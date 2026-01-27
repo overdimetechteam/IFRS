@@ -11,11 +11,65 @@ class_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Class')
 sys.path.insert(0, class_path)
 
 from BasicExcelFunctionsClass import ExcelPortfolioAutomation
+import pandas as pd
 
 
-def copy_pivot_between_sheets():
+def consolidate_summary_files_to_test_file():
     """
-    Copy pivot table data from Portfolio_2 to Portfolio_1 sheet
+    Consolidate data from 6 summary files and save to a test Excel file
+    """
+    # Define paths
+    input_folder = r"C:\Users\Ashen Alwis\Desktop\Impairment Claculation\Impairment Claculation\Input Files\PD"
+    output_folder = r"C:\Users\Ashen Alwis\Desktop\Impairment Claculation\Impairment Claculation\OutPut\PD"
+
+    # Create output filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    test_output_file = os.path.join(output_folder, f"Test_Consolidated_Summary_{timestamp}.xlsx")
+
+    # Ensure output directory exists
+    os.makedirs(output_folder, exist_ok=True)
+
+    print("="*80)
+    print("Starting Summary Files Consolidation")
+    print("="*80)
+    print(f"Input folder: {input_folder}")
+    print(f"Test output file: {test_output_file}")
+    print()
+
+    # Use the static method to consolidate summary files
+    # Try different header rows (start from row 0 and search up to row 10)
+    consolidated_df = ExcelPortfolioAutomation.consolidate_summary_files(
+        input_folder=input_folder,
+        file_pattern="3. Summary_*.xlsb",
+        sheet_name="SUMMARY",
+        header_row=0  # Will auto-search for the correct header row
+    )
+
+    if not consolidated_df.empty:
+        # Save to test Excel file
+        print(f"   Saving consolidated data to test file: {test_output_file}")
+        with pd.ExcelWriter(test_output_file, engine='openpyxl') as writer:
+            consolidated_df.to_excel(writer, sheet_name='Consolidated_Data', index=False)
+        print(f"    Test file saved successfully!")
+        print()
+
+        print("="*80)
+        print("Summary Consolidation completed successfully!")
+        print(f"Total records: {len(consolidated_df)}")
+        print(f"Test file saved to: {test_output_file}")
+        print("="*80)
+        print()
+
+        return consolidated_df
+    else:
+        print("   No data to save")
+        print()
+        return None
+
+
+def copy_data_between_sheets():
+    """
+    Copy table data from Portfolio_2 to Portfolio_1 sheet and refresh pivot table
     """
     # Define file paths
     input_file = r"C:\Users\Ashen Alwis\Desktop\Impairment Claculation\Impairment Claculation\Input Files\PD\01. PD_data_2024-25.xlsb"
@@ -29,7 +83,7 @@ def copy_pivot_between_sheets():
     os.makedirs(output_folder, exist_ok=True)
 
     print("="*80)
-    print("Starting Pivot Table Copy Automation")
+    print("Starting Data Copy Automation")
     print("="*80)
     print(f"Input file: {input_file}")
     print(f"Output file: {output_file}")
@@ -38,8 +92,8 @@ def copy_pivot_between_sheets():
     # Use context manager to handle Excel operations
     with ExcelPortfolioAutomation(input_file, visible=True) as excel:
 
-        # Step 1: Read pivot table data from Portfolio_2 sheet (only actual data, not empty rows)
-        print("Step 1: Reading pivot table data from Portfolio_2 sheet...")
+        # Step 1: Read table data from Portfolio_2 sheet (only actual data, not empty rows)
+        print("Step 1: Reading table data from Portfolio_2 sheet...")
 
         # First, find the actual last row with data in Portfolio_2
         sheet_p2 = excel.workbook.sheets['Portfolio_2']
@@ -93,72 +147,8 @@ def copy_pivot_between_sheets():
             traceback.print_exc()
         print()
 
-        # Step 5: Find all pivot tables in the workbook first
-        print("Step 5: Finding all pivot tables in workbook...")
-        all_pivots = excel.find_all_pivot_tables()
-        print()
-
-        # Step 6: Update pivot tables that reference Portfolio_1 data
-        print("Step 6: Updating pivot tables that reference Portfolio_1...")
-        try:
-            # Get the actual last row with data in Portfolio_1
-            sheet_p1 = excel.workbook.sheets['Portfolio_1']
-            last_row_p1 = sheet_p1.range('A2').end('down').row
-            print(f"   Last row with data in Portfolio_1: {last_row_p1}")
-
-            workbook_name = excel.workbook.name
-            updated_count = 0
-
-            # Iterate through all sheets that have pivot tables
-            if all_pivots:
-                for sheet_name, pivot_names in all_pivots.items():
-                    sheet = excel.workbook.sheets[sheet_name]
-                    pivot_tables = sheet.api.PivotTables()
-
-                    for i in range(1, pivot_tables.Count + 1):
-                        pivot_table = pivot_tables(i)
-                        pivot_table_name = pivot_table.Name
-
-                        # Check if this pivot table's source references Portfolio_1
-                        try:
-                            source_data = pivot_table.SourceData
-                            print(f"   Checking pivot '{pivot_table_name}' in sheet '{sheet_name}'")
-                            print(f"     Current source: {source_data}")
-
-                            if 'Portfolio_1' in source_data:
-                                # Update the source range
-                                new_source_range = f"Portfolio_1!$A$1:$H${last_row_p1}"
-                                full_source = f"'{workbook_name}'!{new_source_range}"
-
-                                print(f"     Updating to: {new_source_range}")
-
-                                pivot_table.ChangePivotCache(
-                                    excel.workbook.api.PivotCaches().Create(
-                                        SourceType=1,  # xlDatabase
-                                        SourceData=full_source
-                                    )
-                                )
-
-                                # Refresh the pivot table
-                                pivot_table.RefreshTable()
-                                print(f"     Successfully updated and refreshed!")
-                                updated_count += 1
-                            else:
-                                print(f"     Skipping (does not reference Portfolio_1)")
-                        except Exception as e:
-                            print(f"     Error checking/updating this pivot: {e}")
-
-                print(f"\n   Updated {updated_count} pivot table(s)")
-            else:
-                print("   No pivot tables found in workbook")
-        except Exception as e:
-            print(f"   Error updating pivot tables: {e}")
-            import traceback
-            traceback.print_exc()
-        print()
-
-        # Step 7: Save as new file
-        print("Step 7: Saving modified workbook...")
+        # Step 5: Save as new file
+        print("Step 5: Saving modified workbook...")
         excel.save_as(output_file)
         print()
 
@@ -170,7 +160,24 @@ def copy_pivot_between_sheets():
 
 if __name__ == "__main__":
     try:
-        copy_pivot_between_sheets()
+        # Step 0: Consolidate summary files first (test run)
+        print("\n" + "="*80)
+        print("STEP 0: CONSOLIDATING SUMMARY FILES (TEST)")
+        print("="*80 + "\n")
+
+        consolidated_df = consolidate_summary_files_to_test_file()
+
+        if consolidated_df is not None:
+            print("\n" + "="*80)
+            print("STEP 1: COPYING DATA BETWEEN SHEETS")
+            print("="*80 + "\n")
+
+            # Proceed with the main workflow
+            copy_data_between_sheets()
+        else:
+            print("\nError: Could not consolidate summary files. Aborting.")
+            sys.exit(1)
+
     except Exception as e:
         print(f"\nError occurred: {str(e)}")
         import traceback
