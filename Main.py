@@ -69,7 +69,7 @@ def consolidate_summary_files_to_test_file():
 
 def copy_data_between_sheets():
     """
-    Copy table data from Portfolio_2 to Portfolio_1 sheet and refresh pivot table
+    Copy table data from Portfolio_2 to Portfolio_1 sheet and refresh pivot tabl
     """
     # Define file paths
     input_file = r"C:\Users\Ashen Alwis\Desktop\Impairment Claculation\Impairment Claculation\Input Files\PD\01. PD_data_2024-25.xlsb"
