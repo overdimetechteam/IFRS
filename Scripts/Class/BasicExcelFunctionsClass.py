@@ -613,3 +613,123 @@ class ExcelPortfolioAutomation:
             print(f"    No pivot tables found in workbook")
 
         return pivot_tables_dict
+
+    @staticmethod
+    def consolidate_summary_files(input_folder: str, file_pattern: str = "3. Summary_*.xlsb",
+                                   sheet_name: str = "SUMMARY", header_row: int = 0) -> pd.DataFrame:
+        """
+        Consolidate data from multiple summary Excel files into a single DataFrame
+
+        Args:
+            input_folder: Path to folder containing summary files
+            file_pattern: Pattern to match summary files (default: "3. Summary_*.xlsb")
+            sheet_name: Name of the sheet to read from (default: "SUMMARY")
+            header_row: Row number containing column headers (default: 0)
+
+        Returns:
+            pd.DataFrame: Consolidated dataframe with columns CONTRACT_NO, EQT_DESC, PD_CATEGORY, DPD, MONTH
+        """
+        print(f"   Consolidating summary files from: {input_folder}")
+        print(f"   File pattern: {file_pattern}")
+        print()
+
+        # Find all matching files
+        import glob as glob_module
+        search_pattern = os.path.join(input_folder, file_pattern)
+        all_summary_files = sorted(glob_module.glob(search_pattern))
+
+        # Take only the latest 6 files
+        summary_files = all_summary_files[-6:] if len(all_summary_files) >= 6 else all_summary_files
+
+        print(f"   Found {len(all_summary_files)} summary files, using latest {len(summary_files)}:")
+        for file in summary_files:
+            print(f"     - {os.path.basename(file)}")
+        print()
+
+        # Column mapping: source column name -> target column name
+        column_mapping = {
+            'CONTRACT NO': 'CONTRACT_NO',
+            'EQUIPMENT DESCRIPTION': 'EQT_DESC',
+            'PD/LGD CATEGORY': 'PD_CATEGORY',
+            'CLIENT DPD': 'DPD'
+        }
+
+        consolidated_data = []
+
+        for file_path in summary_files:
+            try:
+                print(f"   Processing: {os.path.basename(file_path)}")
+
+                # Read the SUMMARY sheet using pandas (works with closed files)
+                # Try to find the correct header row
+                df = None
+                for try_header in range(header_row, min(header_row + 10, 20)):
+                    try:
+                        temp_df = pd.read_excel(file_path, sheet_name=sheet_name, header=try_header, engine='pyxlsb')
+                        # Check if this row contains the columns we're looking for
+                        if 'CONTRACT NO' in temp_df.columns or 'CONTRACT_NO' in temp_df.columns:
+                            df = temp_df
+                            if try_header != header_row:
+                                print(f"     Found headers at row {try_header} (tried starting from row {header_row})")
+                            break
+                    except:
+                        continue
+
+                if df is None:
+                    # Fall back to specified header row
+                    df = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row, engine='pyxlsb')
+
+                print(f"     Read {len(df)} rows")
+                print(f"     Available columns: {list(df.columns)[:10]}...")  # Show first 10 columns only
+
+                # Select and rename the required columns
+                selected_data = pd.DataFrame()
+
+                for source_col, target_col in column_mapping.items():
+                    # Try to find the column (case-insensitive, with or without spaces)
+                    found_col = None
+                    for col in df.columns:
+                        if str(col).strip().upper() == source_col.upper():
+                            found_col = col
+                            break
+
+                    if found_col:
+                        selected_data[target_col] = df[found_col]
+                    else:
+                        print(f"     Warning: Column '{source_col}' not found in {os.path.basename(file_path)}")
+                        selected_data[target_col] = None
+
+                # Extract date from filename (e.g., "3. Summary_2025-04-30_Final_V2.xlsb" -> "2025-04-30")
+                filename = os.path.basename(file_path)
+                date_match = re.search(r'(\d{4}-\d{2}-\d{2})', filename)
+                if date_match:
+                    month_date = date_match.group(1)
+                else:
+                    month_date = "Unknown"
+
+                selected_data['MONTH'] = month_date
+                print(f"     Extracted month: {month_date}")
+
+                consolidated_data.append(selected_data)
+                print(f"     Successfully extracted {len(selected_data)} rows with {len(selected_data.columns)} columns")
+
+            except Exception as e:
+                print(f"     Error processing {os.path.basename(file_path)}: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # Combine all dataframes
+        if consolidated_data:
+            final_df = pd.concat(consolidated_data, ignore_index=True)
+            print()
+            print(f"   Consolidation complete!")
+            print(f"     Total rows: {len(final_df)}")
+            print(f"     Total columns: {len(final_df.columns)}")
+            print(f"     Columns: {list(final_df.columns)}")
+            return final_df
+        else:
+            print()
+            print(f"   No data consolidated")
+            return pd.DataFrame()
+
+
