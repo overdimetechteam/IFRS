@@ -1,79 +1,88 @@
 """
 Main script to automate Excel pivot table operations
-Task: Copy pivot table from Portfolio_2 sheet to Portfolio_1 sheet
+Workflow:
+1. Copy Portfolio_2 to Portfolio_1 (preserve previous data)
+2. Extract 6 summary files into DataFrame
+3. Paste mapped data to Portfolio_2 sheet (filter empty rows)
+4. Refresh pivot table in 01.Pivoted_Portfolio
 """
 import os
 import sys
 from datetime import datetime
 
 # Add the Class directory to the path so we can import BasicExcelFunctionsClass
-class_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Class')
+class_path = os.path.join(os.path.dirname(__file__), 'Scripts', 'Class')
 sys.path.insert(0, class_path)
 
 from BasicExcelFunctionsClass import ExcelPortfolioAutomation
 import pandas as pd
 
 
-def consolidate_summary_files_to_test_file():
+def extract_summary_files_to_dataframe(input_folder: str) -> pd.DataFrame:
     """
-    Consolidate data from 6 summary files and save to a test Excel file
+    Step 2: Extract data from 6 summary files into a DataFrame
+
+    Returns:
+        DataFrame with columns: CONTRACT_NO, EQT_DESC, PD_CATEGORY, DPD, MONTH
     """
-    # Define paths
-    input_folder = r"C:\Users\Ashen Alwis\Desktop\Impairment Claculation\Impairment Claculation\Input Files\PD"
-    output_folder = r"C:\Users\Ashen Alwis\Desktop\Impairment Claculation\Impairment Claculation\OutPut\PD"
-
-    # Create output filename with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    test_output_file = os.path.join(output_folder, f"Test_Consolidated_Summary_{timestamp}.xlsx")
-
-    # Ensure output directory exists
-    os.makedirs(output_folder, exist_ok=True)
-
     print("="*80)
-    print("Starting Summary Files Consolidation")
+    print("STEP 2: EXTRACTING SUMMARY FILES TO DATAFRAME")
     print("="*80)
     print(f"Input folder: {input_folder}")
-    print(f"Test output file: {test_output_file}")
     print()
 
     # Use the static method to consolidate summary files
-    # Try different header rows (start from row 0 and search up to row 10)
     consolidated_df = ExcelPortfolioAutomation.consolidate_summary_files(
         input_folder=input_folder,
         file_pattern="3. Summary_*.xlsb",
         sheet_name="SUMMARY",
-        header_row=0  # Will auto-search for the correct header row
+        header_row=0
     )
 
     if not consolidated_df.empty:
-        # Save to test Excel file
-        print(f"   Saving consolidated data to test file: {test_output_file}")
-        with pd.ExcelWriter(test_output_file, engine='openpyxl') as writer:
-            consolidated_df.to_excel(writer, sheet_name='Consolidated_Data', index=False)
-        print(f"    Test file saved successfully!")
-        print()
+        print(f"\nExtracted {len(consolidated_df)} rows from summary files")
 
-        print("="*80)
-        print("Summary Consolidation completed successfully!")
-        print(f"Total records: {len(consolidated_df)}")
-        print(f"Test file saved to: {test_output_file}")
-        print("="*80)
-        print()
+        # Step 4: Filter out empty rows where CONTRACT_NO, EQT_DESC, PD_CATEGORY, DPD are all empty
+        # but MONTH has a value (like "-, -, -, -, 09/30/2025")
+        print("\nFiltering out empty data rows...")
+
+        before_filter = len(consolidated_df)
+
+        # Check if key data columns have actual values (not null, not empty string, not just dashes)
+        def is_valid_value(val):
+            if pd.isna(val):
+                return False
+            if str(val).strip() in ['', '-', 'nan', 'None']:
+                return False
+            return True
+
+        # Keep rows where at least CONTRACT_NO has a valid value
+        consolidated_df = consolidated_df[
+            consolidated_df['CONTRACT_NO'].apply(is_valid_value)
+        ]
+
+        after_filter = len(consolidated_df)
+        print(f"Filtered out {before_filter - after_filter} empty rows")
+        print(f"Remaining rows: {after_filter}")
 
         return consolidated_df
     else:
-        print("   No data to save")
-        print()
-        return None
+        print("No data extracted from summary files")
+        return pd.DataFrame()
 
 
-def copy_data_between_sheets():
+def run_pd_automation():
     """
-    Copy table data from Portfolio_2 to Portfolio_1 sheet and refresh pivot tabl
+    Main automation workflow:
+    1. Copy Portfolio_2 to Portfolio_1
+    2. Extract summary files to DataFrame
+    3. Paste mapped data to Portfolio_2
+    4. Refresh pivot table
     """
-    # Define file paths
-    input_file = r"C:\Users\Ashen Alwis\Desktop\Impairment Claculation\Impairment Claculation\Input Files\PD\01. PD_data_2024-25.xlsb"
-    output_folder = r"C:\Users\Ashen Alwis\Desktop\Impairment Claculation\Impairment Claculation\OutPut\PD"
+    # Define paths
+    input_folder = r"C:\Users\Ashen Alwis\Desktop\Impairment Claculation\Input Files\PD"
+    output_folder = r"C:\Users\Ashen Alwis\Desktop\Impairment Claculation\OutPut\PD"
+    pd_file = os.path.join(input_folder, "01. PD_data_2024-25.xlsb")
 
     # Create output filename with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -82,102 +91,159 @@ def copy_data_between_sheets():
     # Ensure output directory exists
     os.makedirs(output_folder, exist_ok=True)
 
+    print("\n" + "="*80)
+    print("PD AUTOMATION WORKFLOW")
     print("="*80)
-    print("Starting Data Copy Automation")
-    print("="*80)
-    print(f"Input file: {input_file}")
-    print(f"Output file: {output_file}")
+    print(f"PD File: {pd_file}")
+    print(f"Output File: {output_file}")
     print()
 
-    # Use context manager to handle Excel operations
-    with ExcelPortfolioAutomation(input_file, visible=True) as excel:
+    # =========================================================================
+    # STEP 2: Extract summary files to DataFrame (do this first, before opening Excel)
+    # =========================================================================
+    summary_df = extract_summary_files_to_dataframe(input_folder)
 
-        # Step 1: Read table data from Portfolio_2 sheet (only actual data, not empty rows)
-        print("Step 1: Reading table data from Portfolio_2 sheet...")
+    if summary_df.empty:
+        print("\nError: No data extracted from summary files. Aborting.")
+        return False
 
-        # First, find the actual last row with data in Portfolio_2
+    # Preview the data
+    print("\nData preview (first 5 rows):")
+    print(summary_df.head())
+    print(f"\nColumns: {list(summary_df.columns)}")
+
+    # =========================================================================
+    # Open Excel workbook for Steps 1, 3, 4
+    # =========================================================================
+    with ExcelPortfolioAutomation(pd_file, visible=True) as excel:
+
+        # =====================================================================
+        # STEP 1: Copy Portfolio_2 to Portfolio_1
+        # =====================================================================
+        print("\n" + "="*80)
+        print("STEP 1: COPYING PORTFOLIO_2 TO PORTFOLIO_1")
+        print("="*80)
+
+        # Read data from Portfolio_2
+        print("Reading data from Portfolio_2...")
         sheet_p2 = excel.workbook.sheets['Portfolio_2']
         last_row_p2 = sheet_p2.range('A2').end('down').row
-        print(f"   Detected last row with data in Portfolio_2: {last_row_p2}")
+        print(f"Last row with data in Portfolio_2: {last_row_p2}")
 
-        # Read only the range with actual data (A1:H + last_row)
-        data_range = f"A1:H{last_row_p2}"
-        print(f"   Reading range: {data_range}")
-
+        data_range = f"A1:F{last_row_p2}"
         portfolio_2_data = excel.read_sheet_range_to_dataframe(
             sheet_name='Portfolio_2',
             range_address=data_range
         )
-        print(f"   Data shape: {portfolio_2_data.shape}")
-        print()
+        print(f"Read {len(portfolio_2_data)} rows from Portfolio_2")
 
-        # Step 2: Clear existing data in Portfolio_1 sheet (A2 to H, last row)
-        print("Step 2: Clearing existing data in Portfolio_1 sheet (A2:H)...")
+        # Clear Portfolio_1 data (keep headers)
+        print("\nClearing existing data in Portfolio_1 (A2:F)...")
         try:
             excel.clear_range_dynamic(
                 sheet_name='Portfolio_1',
                 start_cell='A2',
-                end_column='H'
+                end_column='F'
             )
         except Exception as e:
-            print(f"   Note: {e}")
-        print()
+            print(f"Note: {e}")
 
-        # Step 3: Write the data to Portfolio_1 sheet
-        print("Step 3: Writing data to Portfolio_1 sheet...")
+        # Write data to Portfolio_1
+        print("Writing data to Portfolio_1...")
         excel.write_dataframe_to_sheet(
             sheet_name='Portfolio_1',
             start_cell='A1',
             df=portfolio_2_data,
             include_headers=True,
-            clear_existing=False  # Already cleared above
+            clear_existing=False
         )
-        print()
+        print("Portfolio_2 data copied to Portfolio_1 successfully!")
 
-        # Step 4: Refresh pivot table in 01.Pivoted_Portfolio sheet
-        print("Step 4: Refreshing pivot table in 01.Pivoted_Portfolio...")
+        # =====================================================================
+        # STEP 3: Paste mapped data to Portfolio_2
+        # =====================================================================
+        print("\n" + "="*80)
+        print("STEP 3: PASTING SUMMARY DATA TO PORTFOLIO_2")
+        print("="*80)
+
+        # Portfolio_2 table column order:
+        # A: MONTH, B: CONTRACT_NO, C: CONTRACT_NO_NOLASTDI, D: EQT_DESC, E: PD_CATEGORY, F: DPD
+
+        # Create CONTRACT_NO_NOLASTDI (CONTRACT_NO without last digit)
+        summary_df['CONTRACT_NO_NOLASTDI'] = summary_df['CONTRACT_NO'].apply(
+            lambda x: str(x)[:-1] if pd.notna(x) and len(str(x)) > 0 else ''
+        )
+
+        # Prepare data for Portfolio_2 - select and order columns to match table structure
+        portfolio_2_columns = ['MONTH', 'CONTRACT_NO', 'CONTRACT_NO_NOLASTDI', 'EQT_DESC', 'PD_CATEGORY', 'DPD']
+
+        # Select only the mapped columns in the correct order
+        mapped_df = summary_df[portfolio_2_columns].copy()
+
+        print(f"Mapped DataFrame has {len(mapped_df)} rows")
+        print(f"Columns to write: {list(mapped_df.columns)}")
+
+        # Clear existing data in Portfolio_2 (keep the table structure/headers)
+        print("\nClearing existing data in Portfolio_2 (A2:F)...")
+        try:
+            excel.clear_range_dynamic(
+                sheet_name='Portfolio_2',
+                start_cell='A2',
+                end_column='F'
+            )
+        except Exception as e:
+            print(f"Note: {e}")
+
+        # Write the mapped data to Portfolio_2 (starting at A2 to preserve headers)
+        print("Writing summary data to Portfolio_2...")
+        sheet_p2 = excel.workbook.sheets['Portfolio_2']
+
+        # Write data without headers (table already has headers)
+        data_values = mapped_df.values.tolist()
+        if data_values:
+            sheet_p2.range('A2').value = data_values
+            print(f"Successfully wrote {len(data_values)} rows to Portfolio_2")
+
+        # =====================================================================
+        # STEP 4: Refresh pivot table
+        # =====================================================================
+        print("\n" + "="*80)
+        print("STEP 4: REFRESHING PIVOT TABLE")
+        print("="*80)
+
         try:
             excel.refresh_pivot_table(
                 sheet_name='01.Pivoted_Portfolio',
                 pivot_table_name='PivotTable1'
             )
+            print("Pivot table refreshed successfully!")
         except Exception as e:
-            print(f"   Error refreshing pivot table: {e}")
+            print(f"Error refreshing pivot table: {e}")
             import traceback
             traceback.print_exc()
-        print()
 
-        # Step 5: Save as new file
-        print("Step 5: Saving modified workbook...")
+        # =====================================================================
+        # Save the file
+        # =====================================================================
+        print("\n" + "="*80)
+        print("SAVING FILE")
+        print("="*80)
+
         excel.save_as(output_file)
-        print()
+        print(f"File saved to: {output_file}")
 
+    print("\n" + "="*80)
+    print("AUTOMATION COMPLETED SUCCESSFULLY!")
     print("="*80)
-    print("Automation completed successfully!")
-    print(f"Output saved to: {output_file}")
-    print("="*80)
+
+    return True
 
 
 if __name__ == "__main__":
     try:
-        # Step 0: Consolidate summary files first (test run)
-        print("\n" + "="*80)
-        print("STEP 0: CONSOLIDATING SUMMARY FILES (TEST)")
-        print("="*80 + "\n")
-
-        consolidated_df = consolidate_summary_files_to_test_file()
-
-        if consolidated_df is not None:
-            print("\n" + "="*80)
-            print("STEP 1: COPYING DATA BETWEEN SHEETS")
-            print("="*80 + "\n")
-
-            # Proceed with the main workflow
-            copy_data_between_sheets()
-        else:
-            print("\nError: Could not consolidate summary files. Aborting.")
+        success = run_pd_automation()
+        if not success:
             sys.exit(1)
-
     except Exception as e:
         print(f"\nError occurred: {str(e)}")
         import traceback

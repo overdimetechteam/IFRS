@@ -699,11 +699,12 @@ class ExcelPortfolioAutomation:
                         print(f"     Warning: Column '{source_col}' not found in {os.path.basename(file_path)}")
                         selected_data[target_col] = None
 
-                # Extract date from filename (e.g., "3. Summary_2025-04-30_Final_V2.xlsb" -> "2025-04-30")
+                # Extract date from filename (e.g., "3. Summary_2025-04-30_Final_V2.xlsb" -> "04/30/2025")
                 filename = os.path.basename(file_path)
-                date_match = re.search(r'(\d{4}-\d{2}-\d{2})', filename)
+                date_match = re.search(r'(\d{4})-(\d{2})-(\d{2})', filename)
                 if date_match:
-                    month_date = date_match.group(1)
+                    year, month, day = date_match.groups()
+                    month_date = f"{month}/{day}/{year}"
                 else:
                     month_date = "Unknown"
 
