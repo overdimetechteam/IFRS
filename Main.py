@@ -1,7 +1,7 @@
 """
 Main script to automate Excel pivot table operations
 Workflow:
-1. Copy Portfolio_2 to Portfolio_1 (preserve previous data)
+1. Update Portfolio_1: Delete first 6 months, keep most recent month + append all Portfolio_2 data
 2. Extract 6 summary files into DataFrame
 3. Paste mapped data to Portfolio_2 sheet (filter empty rows)
 4. Refresh pivot table in 01.Pivoted_Portfolio
@@ -74,7 +74,7 @@ def extract_summary_files_to_dataframe(input_folder: str) -> pd.DataFrame:
 def run_pd_automation():
     """
     Main automation workflow:
-    1. Copy Portfolio_2 to Portfolio_1
+    1. Update Portfolio_1 (delete first 6 months, keep most recent + append Portfolio_2)
     2. Extract summary files to DataFrame
     3. Paste mapped data to Portfolio_2
     4. Refresh pivot table
@@ -118,27 +118,66 @@ def run_pd_automation():
     with ExcelPortfolioAutomation(pd_file, visible=True) as excel:
 
         # =====================================================================
-        # STEP 1: Copy Portfolio_2 to Portfolio_1
+        # STEP 1: Update Portfolio_1 (delete first 6 months, keep most recent + append Portfolio_2)
         # =====================================================================
         print("\n" + "="*80)
-        print("STEP 1: COPYING PORTFOLIO_2 TO PORTFOLIO_1")
+        print("STEP 1: UPDATING PORTFOLIO_1")
         print("="*80)
 
-        # Read data from Portfolio_2
-        print("Reading data from Portfolio_2...")
+        # Read CURRENT Portfolio_1 data
+        print("Reading current Portfolio_1 data...")
+        sheet_p1 = excel.workbook.sheets['Portfolio_1']
+        last_row_p1 = sheet_p1.range('A2').end('down').row
+        print(f"Last row with data in Portfolio_1: {last_row_p1}")
+
+        data_range_p1 = f"A1:F{last_row_p1}"
+        portfolio_1_data = excel.read_sheet_range_to_dataframe(
+            sheet_name='Portfolio_1',
+            range_address=data_range_p1
+        )
+        print(f"Read {len(portfolio_1_data)} rows from Portfolio_1")
+
+        # Filter Portfolio_1 to keep ONLY the most recent month (delete first 6 months)
+        portfolio_1_filtered = pd.DataFrame()
+        if not portfolio_1_data.empty and 'MONTH' in portfolio_1_data.columns:
+            # Convert MONTH column to datetime for proper sorting
+            portfolio_1_data['MONTH_DATE'] = pd.to_datetime(portfolio_1_data['MONTH'], format='%m/%d/%Y', errors='coerce')
+            
+            # Find the most recent month in Portfolio_1
+            most_recent_month_p1 = portfolio_1_data['MONTH_DATE'].max()
+            print(f"\nMost recent month in Portfolio_1: {most_recent_month_p1.strftime('%m/%d/%Y') if pd.notna(most_recent_month_p1) else 'N/A'}")
+            
+            # Keep ONLY the most recent month's data (delete first 6 months)
+            portfolio_1_filtered = portfolio_1_data[portfolio_1_data['MONTH_DATE'] == most_recent_month_p1].copy()
+            
+            # Drop the temporary MONTH_DATE column
+            portfolio_1_filtered = portfolio_1_filtered.drop(columns=['MONTH_DATE'])
+            
+            print(f"Keeping {len(portfolio_1_filtered)} rows from most recent month")
+            print(f"Deleting {len(portfolio_1_data) - len(portfolio_1_filtered)} rows from older months")
+        else:
+            print("Warning: Could not filter Portfolio_1 by month")
+
+        # Read ALL Portfolio_2 data
+        print("\nReading Portfolio_2 data...")
         sheet_p2 = excel.workbook.sheets['Portfolio_2']
         last_row_p2 = sheet_p2.range('A2').end('down').row
         print(f"Last row with data in Portfolio_2: {last_row_p2}")
 
-        data_range = f"A1:F{last_row_p2}"
+        data_range_p2 = f"A1:F{last_row_p2}"
         portfolio_2_data = excel.read_sheet_range_to_dataframe(
             sheet_name='Portfolio_2',
-            range_address=data_range
+            range_address=data_range_p2
         )
         print(f"Read {len(portfolio_2_data)} rows from Portfolio_2")
 
-        # Clear Portfolio_1 data (keep headers)
-        print("\nClearing existing data in Portfolio_1 (A2:F)...")
+        # Combine: Portfolio_1 most recent month + ALL Portfolio_2 data
+        print("\nCombining Portfolio_1 (most recent month) + ALL Portfolio_2 data...")
+        combined_portfolio_1 = pd.concat([portfolio_1_filtered, portfolio_2_data], ignore_index=True)
+        print(f"Combined: {len(portfolio_1_filtered)} (P1) + {len(portfolio_2_data)} (P2) = {len(combined_portfolio_1)} total rows")
+
+        # Clear Portfolio_1 and write the combined data
+        print("\nClearing Portfolio_1...")
         try:
             excel.clear_range_dynamic(
                 sheet_name='Portfolio_1',
@@ -148,16 +187,15 @@ def run_pd_automation():
         except Exception as e:
             print(f"Note: {e}")
 
-        # Write data to Portfolio_1
-        print("Writing data to Portfolio_1...")
+        print("Writing updated data to Portfolio_1...")
         excel.write_dataframe_to_sheet(
             sheet_name='Portfolio_1',
             start_cell='A1',
-            df=portfolio_2_data,
+            df=combined_portfolio_1,
             include_headers=True,
             clear_existing=False
         )
-        print("Portfolio_2 data copied to Portfolio_1 successfully!")
+        print(f"Portfolio_1 updated successfully with {len(combined_portfolio_1)} rows!")
 
         # =====================================================================
         # STEP 3: Paste mapped data to Portfolio_2
