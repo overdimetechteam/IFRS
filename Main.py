@@ -1,16 +1,28 @@
 """
-Main script to automate Excel pivot table operations
-Workflow:
-1. Update Portfolio_1: Delete first 6 months, keep most recent month + append all Portfolio_2 data
-2. Extract 6 summary files into DataFrame
-3. Paste mapped data to Portfolio_2 sheet (filter empty rows)
-4. Refresh pivot table in 01.Pivoted_Portfolio
+PD Portfolio Roll-Forward Automation
+=====================================
+Dynamic month-driven rollover maintaining:
+- Portfolio_2: Latest 6 months
+- Portfolio_1: Older 7 months
+- Total: Always 13 months
+
+Flow:
+1. Read latest month from config file
+2. Get user input for new end month
+3. Calculate N = months to process
+4. Extract N summary files (1 file = 1 month)
+5. Shift oldest N months from Portfolio_2 → Portfolio_1
+6. Remove oldest N months from Portfolio_1
+7. Append N new months to Portfolio_2
+8. Refresh pivot table and save
 """
 import os
 import sys
+import calendar
 from datetime import datetime
+import glob as glob_module
 
-# Add the Class directory to the path so we can import BasicExcelFunctionsClass
+# Add the Class directory to the path
 class_path = os.path.join(os.path.dirname(__file__), 'Scripts', 'Class')
 sys.path.insert(0, class_path)
 
@@ -18,272 +30,417 @@ from BasicExcelFunctionsClass import ExcelPortfolioAutomation
 import pandas as pd
 
 
-def extract_summary_files_to_dataframe(input_folder: str) -> pd.DataFrame:
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+INPUT_FOLDER = r"C:\Users\Ashen Alwis\Desktop\Impairment Claculation\Input Files\PD"
+OUTPUT_FOLDER = r"C:\Users\Ashen Alwis\Desktop\Impairment Claculation\OutPut\PD"
+PD_FILE = os.path.join(INPUT_FOLDER, "01. PD_data_2024-25.xlsb")
+CONFIG_FILE = os.path.join(INPUT_FOLDER, "latest_month.txt")
+
+PORTFOLIO_2_MONTHS = 6   # Latest months in Portfolio_2
+PORTFOLIO_1_MONTHS = 7   # Older months in Portfolio_1
+TOTAL_MONTHS = 13        # Total across both portfolios
+
+# Column mapping: Summary file column -> DataFrame column
+COLUMN_MAPPING = {
+    'CONTRACT NO': 'CONTRACT_NO',
+    'EQUIPMENT DESCRIPTION': 'EQT_DESC',
+    'PD/LGD CATEGORY': 'PD_CATEGORY',
+    'CLIENT DPD': 'DPD'
+}
+
+# Columns to write from DataFrame to Portfolio sheets (only these 5, leave other columns alone)
+DF_TO_PORTFOLIO_COLUMNS = ['MONTH', 'CONTRACT_NO', 'EQT_DESC', 'PD_CATEGORY', 'DPD']
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+def add_months(date: datetime, months: int) -> datetime:
+    """Add months to a date, handling month-end correctly."""
+    month = date.month - 1 + months
+    year = date.year + month // 12
+    month = month % 12 + 1
+    day = min(date.day, calendar.monthrange(year, month)[1])
+    return datetime(year, month, day)
+
+
+def months_between(start_date: datetime, end_date: datetime) -> int:
+    """Calculate number of months between two dates."""
+    return (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
+
+
+def parse_month_string(month_str: str) -> datetime:
+    """Parse MM/DD/YYYY string to datetime."""
+    return datetime.strptime(month_str.strip(), '%m/%d/%Y')
+
+
+def format_month_string(date: datetime) -> str:
+    """Format datetime to MM/DD/YYYY string."""
+    return date.strftime('%m/%d/%Y')
+
+
+# =============================================================================
+# CONFIG FILE OPERATIONS
+# =============================================================================
+def read_config() -> datetime:
+    """Read the latest recorded month from config file."""
+    if not os.path.exists(CONFIG_FILE):
+        print(f"ERROR: Config file not found: {CONFIG_FILE}")
+        print(f"Please create the file with the latest month in MM/DD/YYYY format.")
+        sys.exit(1)
+
+    with open(CONFIG_FILE, 'r') as f:
+        date_str = f.read().strip()
+
+    try:
+        return parse_month_string(date_str)
+    except ValueError:
+        print(f"ERROR: Invalid date format in config file: {date_str}")
+        print("Expected format: MM/DD/YYYY (e.g., 12/31/2024)")
+        sys.exit(1)
+
+
+def save_config(latest_month: datetime):
+    """Save the latest month to config file."""
+    with open(CONFIG_FILE, 'w') as f:
+        f.write(format_month_string(latest_month))
+    print(f"Config updated: {format_month_string(latest_month)}")
+
+
+# =============================================================================
+# USER INPUT
+# =============================================================================
+def get_end_month_from_args() -> datetime:
+    """Get the new end month from command line argument."""
+    if len(sys.argv) < 2:
+        print("\nUsage: python Main.py MM/DD/YYYY")
+        print("Example: python Main.py 09/30/2025")
+        sys.exit(1)
+
+    date_str = sys.argv[1].strip()
+    try:
+        return parse_month_string(date_str)
+    except ValueError:
+        print(f"\nERROR: Invalid date format: {date_str}")
+        print("Expected format: MM/DD/YYYY (e.g., 09/30/2025)")
+        sys.exit(1)
+
+
+# =============================================================================
+# SUMMARY FILE OPERATIONS
+# =============================================================================
+def find_summary_files(start_month: datetime, num_months: int) -> list:
     """
-    Step 2: Extract data from 6 summary files into a DataFrame
+    Find summary files for the specified number of months after start_month.
+    Returns list of (file_path, month_date) tuples in chronological order.
+    """
+    files = []
+
+    for i in range(1, num_months + 1):
+        target_date = add_months(start_month, i)
+        # Summary files use YYYY-MM-DD format in filename
+        date_pattern = target_date.strftime('%Y-%m-%d')
+
+        pattern = os.path.join(INPUT_FOLDER, f"3. Summary_{date_pattern}*.xlsb")
+        matches = glob_module.glob(pattern)
+
+        if matches:
+            files.append((matches[0], target_date))
+            print(f"  Found: {os.path.basename(matches[0])}")
+        else:
+            print(f"  WARNING: No file for {date_pattern}")
+
+    return files
+
+
+def extract_summary_data(file_paths: list) -> pd.DataFrame:
+    """
+    Extract data from summary files into a DataFrame.
+
+    Args:
+        file_paths: List of (file_path, month_date) tuples
 
     Returns:
-        DataFrame with columns: CONTRACT_NO, EQT_DESC, PD_CATEGORY, DPD, MONTH
+        DataFrame with columns matching PORTFOLIO_COLUMNS
     """
-    print("="*80)
-    print("STEP 2: EXTRACTING SUMMARY FILES TO DATAFRAME")
-    print("="*80)
-    print(f"Input folder: {input_folder}")
-    print()
+    all_data = []
 
-    # Use the static method to consolidate summary files
-    consolidated_df = ExcelPortfolioAutomation.consolidate_summary_files(
-        input_folder=input_folder,
-        file_pattern="3. Summary_*.xlsb",
-        sheet_name="SUMMARY",
-        header_row=0
-    )
+    for file_path, month_date in file_paths:
+        try:
+            print(f"  Extracting: {os.path.basename(file_path)}")
 
-    if not consolidated_df.empty:
-        print(f"\nExtracted {len(consolidated_df)} rows from summary files")
+            # Find correct header row
+            df = None
+            for header_row in range(10):
+                try:
+                    temp_df = pd.read_excel(file_path, sheet_name='SUMMARY',
+                                           header=header_row, engine='pyxlsb')
+                    if 'CONTRACT NO' in temp_df.columns:
+                        df = temp_df
+                        break
+                except:
+                    continue
 
-        # Step 4: Filter out empty rows where CONTRACT_NO, EQT_DESC, PD_CATEGORY, DPD are all empty
-        # but MONTH has a value (like "-, -, -, -, 09/30/2025")
-        print("\nFiltering out empty data rows...")
+            if df is None:
+                df = pd.read_excel(file_path, sheet_name='SUMMARY',
+                                  header=0, engine='pyxlsb')
 
-        before_filter = len(consolidated_df)
+            # Map columns
+            extracted = pd.DataFrame()
+            for src_col, tgt_col in COLUMN_MAPPING.items():
+                found = None
+                for col in df.columns:
+                    if str(col).strip().upper() == src_col.upper():
+                        found = col
+                        break
+                extracted[tgt_col] = df[found] if found else None
 
-        # Check if key data columns have actual values (not null, not empty string, not just dashes)
-        def is_valid_value(val):
-            if pd.isna(val):
-                return False
-            if str(val).strip() in ['', '-', 'nan', 'None']:
-                return False
-            return True
+            # Add MONTH column (MM/DD/YYYY format)
+            extracted['MONTH'] = format_month_string(month_date)
 
-        # Keep rows where at least CONTRACT_NO has a valid value
-        consolidated_df = consolidated_df[
-            consolidated_df['CONTRACT_NO'].apply(is_valid_value)
-        ]
+            # Filter empty rows
+            extracted = extracted[extracted['CONTRACT_NO'].notna()]
+            extracted = extracted[~extracted['CONTRACT_NO'].astype(str).isin(['', '-', 'nan', 'None'])]
 
-        after_filter = len(consolidated_df)
-        print(f"Filtered out {before_filter - after_filter} empty rows")
-        print(f"Remaining rows: {after_filter}")
+            # Reorder columns (only the 5 we need)
+            extracted = extracted[DF_TO_PORTFOLIO_COLUMNS]
 
-        return consolidated_df
-    else:
-        print("No data extracted from summary files")
-        return pd.DataFrame()
+            all_data.append(extracted)
+            print(f"    Rows: {len(extracted)}")
+
+        except Exception as e:
+            print(f"    ERROR: {e}")
+
+    if all_data:
+        return pd.concat(all_data, ignore_index=True)
+    return pd.DataFrame(columns=DF_TO_PORTFOLIO_COLUMNS)
 
 
-def run_pd_automation():
+# =============================================================================
+# PORTFOLIO OPERATIONS
+# =============================================================================
+def read_portfolio(excel: ExcelPortfolioAutomation, sheet_name: str) -> pd.DataFrame:
+    """Read portfolio data from sheet (reads all columns as-is)."""
+    sheet = excel.workbook.sheets[sheet_name]
+    last_row = sheet.range('A2').end('down').row
+
+    # Handle empty sheet
+    if last_row > 1000000:
+        return pd.DataFrame(columns=DF_TO_PORTFOLIO_COLUMNS)
+
+    # Read entire used range to preserve all columns
+    df = excel.read_sheet_range_to_dataframe(sheet_name, None)
+    return df
+
+
+def get_unique_months(df: pd.DataFrame) -> list:
+    """Get sorted list of unique months as datetime objects."""
+    if df.empty or 'MONTH' not in df.columns:
+        return []
+
+    months = pd.to_datetime(df['MONTH'], format='%m/%d/%Y', errors='coerce')
+    unique_months = sorted(months.dropna().unique())
+    return [pd.Timestamp(m).to_pydatetime() for m in unique_months]
+
+
+def filter_by_months(df: pd.DataFrame, months_to_keep: list) -> pd.DataFrame:
+    """Filter DataFrame to keep only rows matching specified months."""
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df['_MONTH_DT'] = pd.to_datetime(df['MONTH'], format='%m/%d/%Y', errors='coerce')
+
+    # Convert months_to_keep to timestamps for comparison
+    keep_timestamps = [pd.Timestamp(m) for m in months_to_keep]
+    filtered = df[df['_MONTH_DT'].isin(keep_timestamps)]
+
+    return filtered.drop(columns=['_MONTH_DT'])
+
+
+def write_portfolio(excel: ExcelPortfolioAutomation, sheet_name: str, df: pd.DataFrame):
     """
-    Main automation workflow:
-    1. Update Portfolio_1 (delete first 6 months, keep most recent + append Portfolio_2)
-    2. Extract summary files to DataFrame
-    3. Paste mapped data to Portfolio_2
-    4. Refresh pivot table
+    Write only the 5 mapped columns to Portfolio sheet.
+    Column positions: A=MONTH, B=CONTRACT_NO, C=skip(formula), D=EQT_DESC, E=PD_CATEGORY, F=DPD
+    Other columns (like DC_BUCKET) are left untouched - they are formulas.
     """
-    # Define paths
-    input_folder = r"C:\Users\Ashen Alwis\Desktop\Impairment Claculation\Input Files\PD"
-    output_folder = r"C:\Users\Ashen Alwis\Desktop\Impairment Claculation\OutPut\PD"
-    pd_file = os.path.join(input_folder, "01. PD_data_2024-25.xlsb")
+    sheet = excel.workbook.sheets[sheet_name]
 
-    # Create output filename with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = os.path.join(output_folder, f"01. PD_data_2024-25_Updated_{timestamp}.xlsb")
+    # Clear only the 5 data columns (skip C which is formula column CONTRACT_NO_NOLASTDI)
+    # Also don't touch columns beyond F (like DC_BUCKET which is also a formula)
+    last_row = sheet.range('A2').end('down').row
+    if last_row < 1000000:  # Has data
+        try:
+            sheet.range(f'A2:B{last_row}').clear_contents()  # Clear A and B
+            sheet.range(f'D2:F{last_row}').clear_contents()  # Clear D, E, F (skip C)
+        except:
+            pass
 
-    # Ensure output directory exists
-    os.makedirs(output_folder, exist_ok=True)
+    if df.empty:
+        print(f"  {sheet_name}: No data to write")
+        return
+
+    # Write only the 5 columns we need, to their specific positions
+    # A=MONTH, B=CONTRACT_NO, D=EQT_DESC, E=PD_CATEGORY, F=DPD
+    # Skip column C (CONTRACT_NO_NOLASTDI) - it's a formula
+    num_rows = len(df)
+
+    if 'MONTH' in df.columns:
+        sheet.range('A2').value = df['MONTH'].values.reshape(-1, 1).tolist()
+    if 'CONTRACT_NO' in df.columns:
+        sheet.range('B2').value = df['CONTRACT_NO'].values.reshape(-1, 1).tolist()
+    if 'EQT_DESC' in df.columns:
+        sheet.range('D2').value = df['EQT_DESC'].values.reshape(-1, 1).tolist()
+    if 'PD_CATEGORY' in df.columns:
+        sheet.range('E2').value = df['PD_CATEGORY'].values.reshape(-1, 1).tolist()
+    if 'DPD' in df.columns:
+        sheet.range('F2').value = df['DPD'].values.reshape(-1, 1).tolist()
+
+    print(f"  {sheet_name}: {num_rows} rows written (5 columns: MONTH, CONTRACT_NO, EQT_DESC, PD_CATEGORY, DPD)")
+
+
+# =============================================================================
+# MAIN AUTOMATION
+# =============================================================================
+def run_automation():
+    """Main automation workflow."""
+
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
     print("\n" + "="*80)
-    print("PD AUTOMATION WORKFLOW")
+    print("PD PORTFOLIO ROLL-FORWARD AUTOMATION")
     print("="*80)
-    print(f"PD File: {pd_file}")
-    print(f"Output File: {output_file}")
-    print()
 
-    # =========================================================================
-    # STEP 2: Extract summary files to DataFrame (do this first, before opening Excel)
-    # =========================================================================
-    summary_df = extract_summary_files_to_dataframe(input_folder)
+    # Step 1: Read current latest month from config
+    current_latest = read_config()
+    print(f"\nCurrent latest month: {format_month_string(current_latest)}")
 
-    if summary_df.empty:
-        print("\nError: No data extracted from summary files. Aborting.")
+    # Step 2: Get new end month from command line argument
+    new_end_month = get_end_month_from_args()
+    print(f"New end month: {format_month_string(new_end_month)}")
+
+    # Step 3: Calculate months to process
+    num_new_months = months_between(current_latest, new_end_month)
+
+    if num_new_months <= 0:
+        print("\nERROR: New end month must be after current latest month.")
         return False
 
-    # Preview the data
-    print("\nData preview (first 5 rows):")
-    print(summary_df.head())
-    print(f"\nColumns: {list(summary_df.columns)}")
+    if num_new_months > PORTFOLIO_2_MONTHS:
+        print(f"\nWARNING: {num_new_months} months requested, max is {PORTFOLIO_2_MONTHS}.")
+        num_new_months = PORTFOLIO_2_MONTHS
 
-    # =========================================================================
-    # Open Excel workbook for Steps 1, 3, 4
-    # =========================================================================
-    with ExcelPortfolioAutomation(pd_file, visible=True) as excel:
+    print(f"\nMonths to process: {num_new_months}")
 
-        # =====================================================================
-        # STEP 1: Update Portfolio_1 (delete first 6 months, keep most recent + append Portfolio_2)
-        # =====================================================================
-        print("\n" + "="*80)
-        print("STEP 1: UPDATING PORTFOLIO_1")
-        print("="*80)
+    # Step 4: Find and extract summary files
+    print("\n" + "-"*60)
+    print(f"FINDING {num_new_months} SUMMARY FILES")
+    print("-"*60)
 
-        # Read CURRENT Portfolio_1 data
-        print("Reading current Portfolio_1 data...")
-        sheet_p1 = excel.workbook.sheets['Portfolio_1']
-        last_row_p1 = sheet_p1.range('A2').end('down').row
-        print(f"Last row with data in Portfolio_1: {last_row_p1}")
+    summary_files = find_summary_files(current_latest, num_new_months)
 
-        data_range_p1 = f"A1:F{last_row_p1}"
-        portfolio_1_data = excel.read_sheet_range_to_dataframe(
-            sheet_name='Portfolio_1',
-            range_address=data_range_p1
-        )
-        print(f"Read {len(portfolio_1_data)} rows from Portfolio_1")
+    if not summary_files:
+        print("\nERROR: No summary files found.")
+        return False
 
-        # Filter Portfolio_1 to keep ONLY the most recent month (delete first 6 months)
-        portfolio_1_filtered = pd.DataFrame()
-        if not portfolio_1_data.empty and 'MONTH' in portfolio_1_data.columns:
-            # Convert MONTH column to datetime for proper sorting
-            portfolio_1_data['MONTH_DATE'] = pd.to_datetime(portfolio_1_data['MONTH'], format='%m/%d/%Y', errors='coerce')
-            
-            # Find the most recent month in Portfolio_1
-            most_recent_month_p1 = portfolio_1_data['MONTH_DATE'].max()
-            print(f"\nMost recent month in Portfolio_1: {most_recent_month_p1.strftime('%m/%d/%Y') if pd.notna(most_recent_month_p1) else 'N/A'}")
-            
-            # Keep ONLY the most recent month's data (delete first 6 months)
-            portfolio_1_filtered = portfolio_1_data[portfolio_1_data['MONTH_DATE'] == most_recent_month_p1].copy()
-            
-            # Drop the temporary MONTH_DATE column
-            portfolio_1_filtered = portfolio_1_filtered.drop(columns=['MONTH_DATE'])
-            
-            print(f"Keeping {len(portfolio_1_filtered)} rows from most recent month")
-            print(f"Deleting {len(portfolio_1_data) - len(portfolio_1_filtered)} rows from older months")
-        else:
-            print("Warning: Could not filter Portfolio_1 by month")
+    print(f"\nExtracting data...")
+    new_data = extract_summary_data(summary_files)
 
-        # Read ALL Portfolio_2 data
-        print("\nReading Portfolio_2 data...")
-        sheet_p2 = excel.workbook.sheets['Portfolio_2']
-        last_row_p2 = sheet_p2.range('A2').end('down').row
-        print(f"Last row with data in Portfolio_2: {last_row_p2}")
+    if new_data.empty:
+        print("\nERROR: No data extracted.")
+        return False
 
-        data_range_p2 = f"A1:F{last_row_p2}"
-        portfolio_2_data = excel.read_sheet_range_to_dataframe(
-            sheet_name='Portfolio_2',
-            range_address=data_range_p2
-        )
-        print(f"Read {len(portfolio_2_data)} rows from Portfolio_2")
+    print(f"\nNew data: {len(new_data)} rows")
 
-        # Combine: Portfolio_1 most recent month + ALL Portfolio_2 data
-        print("\nCombining Portfolio_1 (most recent month) + ALL Portfolio_2 data...")
-        combined_portfolio_1 = pd.concat([portfolio_1_filtered, portfolio_2_data], ignore_index=True)
-        print(f"Combined: {len(portfolio_1_filtered)} (P1) + {len(portfolio_2_data)} (P2) = {len(combined_portfolio_1)} total rows")
+    # Step 5-7: Open Excel and perform roll-forward
+    print("\n" + "-"*60)
+    print("PERFORMING ROLL-FORWARD")
+    print("-"*60)
 
-        # Clear Portfolio_1 and write the combined data
-        print("\nClearing Portfolio_1...")
+    with ExcelPortfolioAutomation(PD_FILE, visible=True) as excel:
+
+        # Read current portfolios
+        print("\nReading current portfolios...")
+        p1_data = read_portfolio(excel, 'Portfolio_1')
+        p2_data = read_portfolio(excel, 'Portfolio_2')
+
+        p1_months = get_unique_months(p1_data)
+        p2_months = get_unique_months(p2_data)
+
+        print(f"  Portfolio_1: {len(p1_months)} months, {len(p1_data)} rows")
+        print(f"  Portfolio_2: {len(p2_months)} months, {len(p2_data)} rows")
+
+        # Calculate new month distributions
+        new_months = get_unique_months(new_data)
+        all_months = sorted(set(p1_months + p2_months + new_months))
+
+        # Keep only latest 13 months total
+        if len(all_months) > TOTAL_MONTHS:
+            all_months = all_months[-TOTAL_MONTHS:]
+
+        # Split: Portfolio_1 gets older 7, Portfolio_2 gets latest 6
+        new_p1_months = all_months[:PORTFOLIO_1_MONTHS] if len(all_months) > PORTFOLIO_2_MONTHS else []
+        new_p2_months = all_months[-PORTFOLIO_2_MONTHS:] if len(all_months) >= PORTFOLIO_2_MONTHS else all_months
+
+        print(f"\nNew distribution:")
+        print(f"  Portfolio_1: {len(new_p1_months)} months")
+        print(f"  Portfolio_2: {len(new_p2_months)} months")
+        print(f"  Total: {len(new_p1_months) + len(new_p2_months)} months")
+
+        # Combine all data
+        all_data = pd.concat([p1_data, p2_data, new_data], ignore_index=True)
+
+        # Remove duplicates (keep latest)
+        all_data = all_data.drop_duplicates(subset=['MONTH', 'CONTRACT_NO'], keep='last')
+
+        # Split data by new month distributions
+        new_p1_data = filter_by_months(all_data, new_p1_months)
+        new_p2_data = filter_by_months(all_data, new_p2_months)
+
+        # Sort by month
+        new_p1_data = new_p1_data.sort_values('MONTH', key=lambda x: pd.to_datetime(x, format='%m/%d/%Y'))
+        new_p2_data = new_p2_data.sort_values('MONTH', key=lambda x: pd.to_datetime(x, format='%m/%d/%Y'))
+
+        # Write to portfolios
+        print("\nWriting portfolios...")
+        write_portfolio(excel, 'Portfolio_1', new_p1_data)
+        write_portfolio(excel, 'Portfolio_2', new_p2_data)
+
+        # Refresh pivot table
+        print("\nRefreshing pivot table...")
         try:
-            excel.clear_range_dynamic(
-                sheet_name='Portfolio_1',
-                start_cell='A2',
-                end_column='F'
-            )
+            excel.refresh_pivot_table('01.Pivoted_Portfolio', 'PivotTable1')
+            print("  Pivot table refreshed!")
         except Exception as e:
-            print(f"Note: {e}")
+            print(f"  Warning: {e}")
 
-        print("Writing updated data to Portfolio_1...")
-        excel.write_dataframe_to_sheet(
-            sheet_name='Portfolio_1',
-            start_cell='A1',
-            df=combined_portfolio_1,
-            include_headers=True,
-            clear_existing=False
-        )
-        print(f"Portfolio_1 updated successfully with {len(combined_portfolio_1)} rows!")
-
-        # =====================================================================
-        # STEP 3: Paste mapped data to Portfolio_2
-        # =====================================================================
-        print("\n" + "="*80)
-        print("STEP 3: PASTING SUMMARY DATA TO PORTFOLIO_2")
-        print("="*80)
-
-        # Portfolio_2 table column order:
-        # A: MONTH, B: CONTRACT_NO, C: CONTRACT_NO_NOLASTDI, D: EQT_DESC, E: PD_CATEGORY, F: DPD
-
-        # Create CONTRACT_NO_NOLASTDI (CONTRACT_NO without last digit)
-        summary_df['CONTRACT_NO_NOLASTDI'] = summary_df['CONTRACT_NO'].apply(
-            lambda x: str(x)[:-1] if pd.notna(x) and len(str(x)) > 0 else ''
-        )
-
-        # Prepare data for Portfolio_2 - select and order columns to match table structure
-        portfolio_2_columns = ['MONTH', 'CONTRACT_NO', 'CONTRACT_NO_NOLASTDI', 'EQT_DESC', 'PD_CATEGORY', 'DPD']
-
-        # Select only the mapped columns in the correct order
-        mapped_df = summary_df[portfolio_2_columns].copy()
-
-        print(f"Mapped DataFrame has {len(mapped_df)} rows")
-        print(f"Columns to write: {list(mapped_df.columns)}")
-
-        # Clear existing data in Portfolio_2 (keep the table structure/headers)
-        print("\nClearing existing data in Portfolio_2 (A2:F)...")
-        try:
-            excel.clear_range_dynamic(
-                sheet_name='Portfolio_2',
-                start_cell='A2',
-                end_column='F'
-            )
-        except Exception as e:
-            print(f"Note: {e}")
-
-        # Write the mapped data to Portfolio_2 (starting at A2 to preserve headers)
-        print("Writing summary data to Portfolio_2...")
-        sheet_p2 = excel.workbook.sheets['Portfolio_2']
-
-        # Write data without headers (table already has headers)
-        data_values = mapped_df.values.tolist()
-        if data_values:
-            sheet_p2.range('A2').value = data_values
-            print(f"Successfully wrote {len(data_values)} rows to Portfolio_2")
-
-        # =====================================================================
-        # STEP 4: Refresh pivot table
-        # =====================================================================
-        print("\n" + "="*80)
-        print("STEP 4: REFRESHING PIVOT TABLE")
-        print("="*80)
-
-        try:
-            excel.refresh_pivot_table(
-                sheet_name='01.Pivoted_Portfolio',
-                pivot_table_name='PivotTable1'
-            )
-            print("Pivot table refreshed successfully!")
-        except Exception as e:
-            print(f"Error refreshing pivot table: {e}")
-            import traceback
-            traceback.print_exc()
-
-        # =====================================================================
-        # Save the file
-        # =====================================================================
-        print("\n" + "="*80)
-        print("SAVING FILE")
-        print("="*80)
-
+        # Save
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = os.path.join(OUTPUT_FOLDER, f"01. PD_data_2024-25_Updated_{timestamp}.xlsb")
         excel.save_as(output_file)
-        print(f"File saved to: {output_file}")
+        print(f"\nSaved: {output_file}")
+
+    # Update config
+    save_config(new_end_month)
 
     print("\n" + "="*80)
-    print("AUTOMATION COMPLETED SUCCESSFULLY!")
+    print("AUTOMATION COMPLETED!")
     print("="*80)
 
     return True
 
 
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
 if __name__ == "__main__":
     try:
-        success = run_pd_automation()
-        if not success:
-            sys.exit(1)
+        success = run_automation()
+        sys.exit(0 if success else 1)
     except Exception as e:
-        print(f"\nError occurred: {str(e)}")
+        print(f"\nFATAL ERROR: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
