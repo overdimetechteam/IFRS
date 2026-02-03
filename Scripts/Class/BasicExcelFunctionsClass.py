@@ -14,9 +14,9 @@ from datetime import datetime
 import os
 import glob
 import shutil
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import re
-
+import calendar
 
 
 class ExcelPortfolioAutomation:
@@ -614,6 +614,364 @@ class ExcelPortfolioAutomation:
 
         return pivot_tables_dict
 
+    # =============================================================================
+    # NEW METHODS - Moved from Main.py and made dynamic
+    # =============================================================================
+
+    def read_portfolio_data(self, sheet_name: str) -> pd.DataFrame:
+        """
+        Read portfolio data from a sheet (reads all columns as-is).
+        Instance method that uses the current workbook.
+
+        Args:
+            sheet_name: Name of the portfolio sheet to read
+
+        Returns:
+            pd.DataFrame: Portfolio data with all columns
+        """
+        sheet = self.workbook.sheets[sheet_name]
+        last_row = sheet.range('A2').end('down').row
+
+        # Handle empty sheet
+        if last_row > 1000000:
+            print(f"   {sheet_name}: Empty sheet detected")
+            return pd.DataFrame()
+
+        # Read entire used range to preserve all columns
+        df = self.read_sheet_range_to_dataframe(sheet_name, None)
+        return df
+
+    def write_portfolio_data(self, sheet_name: str, df: pd.DataFrame, 
+                            columns_to_write: List[str],
+                            column_positions: dict = None) -> None:
+        """
+        Write specific columns to Portfolio sheet at specified positions.
+        Leaves formula columns untouched.
+
+        Args:
+            sheet_name: Name of the portfolio sheet
+            df: DataFrame containing data to write
+            columns_to_write: List of column names to write (e.g., ['MONTH', 'CONTRACT_NO', ...])
+            column_positions: Dict mapping column names to Excel columns (e.g., {'MONTH': 'A', 'CONTRACT_NO': 'B'})
+                            If None, uses default mapping: A=MONTH, B=CONTRACT_NO, D=EQT_DESC, E=PD_CATEGORY, F=DPD
+        """
+        sheet = self.workbook.sheets[sheet_name]
+
+        # Default column positions if not provided
+        if column_positions is None:
+            column_positions = {
+                'MONTH': 'A',
+                'CONTRACT_NO': 'B',
+                'EQT_DESC': 'D',
+                'PD_CATEGORY': 'E',
+                'DPD': 'F'
+            }
+
+        # Clear only the specified data columns (skip formula columns)
+        last_row = sheet.range('A2').end('down').row
+        if last_row < 1000000:  # Has data
+            try:
+                # Clear columns A and B
+                sheet.range(f'A2:B{last_row}').clear_contents()
+                # Clear columns D, E, F (skip C which is formula)
+                sheet.range(f'D2:F{last_row}').clear_contents()
+            except:
+                pass
+
+        if df.empty:
+            print(f"  {sheet_name}: No data to write")
+            return
+
+        # Write each column to its specified position
+        num_rows = len(df)
+        for col_name in columns_to_write:
+            if col_name in df.columns and col_name in column_positions:
+                excel_col = column_positions[col_name]
+                sheet.range(f'{excel_col}2').value = df[col_name].values.reshape(-1, 1).tolist()
+
+        print(f"  {sheet_name}: {num_rows} rows written ({len(columns_to_write)} columns: {', '.join(columns_to_write)})")
+
+    # =============================================================================
+    # STATIC UTILITY METHODS - Date and File Operations
+    # =============================================================================
+
+    @staticmethod
+    def months_between(start_date: datetime, end_date: datetime) -> int:
+        """
+        Calculate number of months between two dates.
+
+        Args:
+            start_date: Starting date
+            end_date: Ending date
+
+        Returns:
+            int: Number of months between dates
+        """
+        return (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
+
+    @staticmethod
+    def parse_month_string(month_str: str, date_format: str = '%m/%d/%Y') -> datetime:
+        """
+        Parse month string to datetime object.
+
+        Args:
+            month_str: Date string to parse
+            date_format: Format of the date string (default: '%m/%d/%Y')
+
+        Returns:
+            datetime: Parsed datetime object
+        """
+        return datetime.strptime(month_str.strip(), date_format)
+
+    @staticmethod
+    def format_month_string(date: datetime, date_format: str = '%m/%d/%Y') -> str:
+        """
+        Format datetime to string.
+
+        Args:
+            date: Datetime object to format
+            date_format: Desired output format (default: '%m/%d/%Y')
+
+        Returns:
+            str: Formatted date string
+        """
+        return date.strftime(date_format)
+
+    @staticmethod
+    def read_config_file(config_file_path: str, date_format: str = '%m/%d/%Y') -> datetime:
+        """
+        Read the latest recorded month from a config file.
+
+        Args:
+            config_file_path: Path to the config file
+            date_format: Expected date format in config file (default: '%m/%d/%Y')
+
+        Returns:
+            datetime: Latest month from config file
+
+        Raises:
+            FileNotFoundError: If config file doesn't exist
+            ValueError: If date format is invalid
+        """
+        if not os.path.exists(config_file_path):
+            raise FileNotFoundError(f"Config file not found: {config_file_path}")
+
+        with open(config_file_path, 'r') as f:
+            date_str = f.read().strip()
+
+        try:
+            return ExcelPortfolioAutomation.parse_month_string(date_str, date_format)
+        except ValueError:
+            raise ValueError(f"Invalid date format in config file: {date_str}. Expected format: {date_format}")
+
+    @staticmethod
+    def save_config_file(config_file_path: str, latest_month: datetime, date_format: str = '%m/%d/%Y') -> None:
+        """
+        Save the latest month to a config file.
+
+        Args:
+            config_file_path: Path to the config file
+            latest_month: Date to save
+            date_format: Date format to use (default: '%m/%d/%Y')
+        """
+        with open(config_file_path, 'w') as f:
+            f.write(ExcelPortfolioAutomation.format_month_string(latest_month, date_format))
+        print(f"Config updated: {ExcelPortfolioAutomation.format_month_string(latest_month, date_format)}")
+
+    @staticmethod
+    def get_latest_file_in_folder(folder_path: str, file_pattern: str, 
+                                  fallback_file: str = None) -> str:
+        """
+        Get the latest file matching a pattern in a folder.
+        If no files found, returns fallback file.
+
+        Args:
+            folder_path: Path to search for files
+            file_pattern: Glob pattern to match files (e.g., "*.xlsb", "PD_data_*_Updated_*.xlsb")
+            fallback_file: File to return if no matches found (default: None)
+
+        Returns:
+            str: Path to the latest file or fallback file
+        """
+        # Search for files matching pattern
+        search_pattern = os.path.join(folder_path, file_pattern)
+        matching_files = glob.glob(search_pattern)
+
+        if matching_files:
+            # Sort by modification time (most recent first)
+            matching_files.sort(key=os.path.getmtime, reverse=True)
+            latest_file = matching_files[0]
+            print(f"Using latest file: {os.path.basename(latest_file)}")
+            return latest_file
+        else:
+            if fallback_file:
+                print(f"Using fallback file: {os.path.basename(fallback_file)}")
+                return fallback_file
+            else:
+                raise FileNotFoundError(f"No files found matching pattern: {file_pattern}")
+
+    @staticmethod
+    def find_summary_files_by_date_range(input_folder: str, start_month: datetime, 
+                                        num_months: int, file_prefix: str = "3. Summary_",
+                                        file_extension: str = ".xlsb",
+                                        date_format_in_filename: str = '%Y-%m-%d') -> List[Tuple[str, datetime]]:
+        """
+        Find summary files for a specified date range.
+
+        Args:
+            input_folder: Folder containing summary files
+            start_month: Starting month
+            num_months: Number of months to find
+            file_prefix: Prefix of summary files (default: "3. Summary_")
+            file_extension: File extension (default: ".xlsb")
+            date_format_in_filename: Date format used in filenames (default: '%Y-%m-%d')
+
+        Returns:
+            List of (file_path, month_date) tuples in chronological order
+        """
+        files = []
+
+        for i in range(1, num_months + 1):
+            target_date = ExcelPortfolioAutomation.add_months(start_month, i)
+            # Summary files use specified date format in filename
+            date_pattern = target_date.strftime(date_format_in_filename)
+
+            pattern = os.path.join(input_folder, f"{file_prefix}{date_pattern}*{file_extension}")
+            matches = glob.glob(pattern)
+
+            if matches:
+                files.append((matches[0], target_date))
+                print(f"  Found: {os.path.basename(matches[0])}")
+            else:
+                print(f"  WARNING: No file for {date_pattern}")
+
+        return files
+
+    @staticmethod
+    def extract_data_from_summary_files(file_paths: List[Tuple[str, datetime]], 
+                                       column_mapping: dict,
+                                       output_columns: List[str],
+                                       sheet_name: str = 'SUMMARY',
+                                       date_format: str = '%m/%d/%Y',
+                                       max_header_search_rows: int = 10) -> pd.DataFrame:
+        """
+        Extract data from summary files into a DataFrame.
+
+        Args:
+            file_paths: List of (file_path, month_date) tuples
+            column_mapping: Dict mapping source column names to target column names
+                          e.g., {'CONTRACT NO': 'CONTRACT_NO', 'EQUIPMENT DESCRIPTION': 'EQT_DESC'}
+            output_columns: List of columns to include in output (in order)
+            sheet_name: Name of sheet to read (default: 'SUMMARY')
+            date_format: Format for MONTH column (default: '%m/%d/%Y')
+            max_header_search_rows: Maximum rows to search for headers (default: 10)
+
+        Returns:
+            pd.DataFrame: Consolidated data from all summary files
+        """
+        all_data = []
+
+        for file_path, month_date in file_paths:
+            try:
+                print(f"  Extracting: {os.path.basename(file_path)}")
+
+                # Find correct header row
+                df = None
+                for header_row in range(max_header_search_rows):
+                    try:
+                        temp_df = pd.read_excel(file_path, sheet_name=sheet_name,
+                                               header=header_row, engine='pyxlsb')
+                        # Check if any of the source columns exist
+                        if any(col in temp_df.columns for col in column_mapping.keys()):
+                            df = temp_df
+                            break
+                    except:
+                        continue
+
+                if df is None:
+                    df = pd.read_excel(file_path, sheet_name=sheet_name,
+                                      header=0, engine='pyxlsb')
+
+                # Map columns
+                extracted = pd.DataFrame()
+                for src_col, tgt_col in column_mapping.items():
+                    found = None
+                    for col in df.columns:
+                        if str(col).strip().upper() == src_col.upper():
+                            found = col
+                            break
+                    extracted[tgt_col] = df[found] if found else None
+
+                # Add MONTH column
+                extracted['MONTH'] = ExcelPortfolioAutomation.format_month_string(month_date, date_format)
+
+                # Filter empty rows
+                first_col = list(column_mapping.values())[0]  # Use first target column for filtering
+                extracted = extracted[extracted[first_col].notna()]
+                extracted = extracted[~extracted[first_col].astype(str).isin(['', '-', 'nan', 'None'])]
+
+                # Reorder columns
+                extracted = extracted[output_columns]
+
+                all_data.append(extracted)
+                print(f"    Rows: {len(extracted)}")
+
+            except Exception as e:
+                print(f"    ERROR: {e}")
+
+        if all_data:
+            return pd.concat(all_data, ignore_index=True)
+        return pd.DataFrame(columns=output_columns)
+
+    @staticmethod
+    def get_unique_months_from_dataframe(df: pd.DataFrame, month_column: str = 'MONTH',
+                                        date_format: str = '%m/%d/%Y') -> List[datetime]:
+        """
+        Get sorted list of unique months from a DataFrame.
+
+        Args:
+            df: DataFrame containing month data
+            month_column: Name of the column containing month data (default: 'MONTH')
+            date_format: Format of date strings in the column (default: '%m/%d/%Y')
+
+        Returns:
+            List of unique month datetime objects in ascending order
+        """
+        if df.empty or month_column not in df.columns:
+            return []
+
+        months = pd.to_datetime(df[month_column], format=date_format, errors='coerce')
+        unique_months = sorted(months.dropna().unique())
+        return [pd.Timestamp(m).to_pydatetime() for m in unique_months]
+
+    @staticmethod
+    def filter_dataframe_by_months(df: pd.DataFrame, months_to_keep: List[datetime],
+                                   month_column: str = 'MONTH',
+                                   date_format: str = '%m/%d/%Y') -> pd.DataFrame:
+        """
+        Filter DataFrame to keep only rows matching specified months.
+
+        Args:
+            df: DataFrame to filter
+            months_to_keep: List of datetime objects representing months to keep
+            month_column: Name of the month column (default: 'MONTH')
+            date_format: Format of date strings in the column (default: '%m/%d/%Y')
+
+        Returns:
+            pd.DataFrame: Filtered dataframe
+        """
+        if df.empty:
+            return df
+
+        df = df.copy()
+        df['_MONTH_DT'] = pd.to_datetime(df[month_column], format=date_format, errors='coerce')
+
+        # Convert months_to_keep to timestamps for comparison
+        keep_timestamps = [pd.Timestamp(m) for m in months_to_keep]
+        filtered = df[df['_MONTH_DT'].isin(keep_timestamps)]
+
+        return filtered.drop(columns=['_MONTH_DT'])
+
     @staticmethod
     def consolidate_summary_files(input_folder: str, file_pattern: str = "3. Summary_*.xlsb",
                                    sheet_name: str = "SUMMARY", header_row: int = 0) -> pd.DataFrame:
@@ -634,9 +992,8 @@ class ExcelPortfolioAutomation:
         print()
 
         # Find all matching files
-        import glob as glob_module
         search_pattern = os.path.join(input_folder, file_pattern)
-        all_summary_files = sorted(glob_module.glob(search_pattern))
+        all_summary_files = sorted(glob.glob(search_pattern))
 
         # Take only the latest 6 files
         summary_files = all_summary_files[-6:] if len(all_summary_files) >= 6 else all_summary_files
@@ -733,4 +1090,26 @@ class ExcelPortfolioAutomation:
             print(f"   No data consolidated")
             return pd.DataFrame()
 
+    @staticmethod
+    def add_months(date: datetime, months: int) -> datetime:
+        """Add months to a date, handling month-end correctly.
+        If original date is month-end, result will also be month-end."""
+        # Check if original date is the last day of its month
+        original_month_last_day = calendar.monthrange(date.year, date.month)[1]
+        is_month_end = (date.day == original_month_last_day)
 
+        # Calculate target month/year
+        month = date.month - 1 + months
+        year = date.year + month // 12
+        month = month % 12 + 1
+
+        # Get last day of target month
+        target_month_last_day = calendar.monthrange(year, month)[1]
+
+        # If original was month-end, use target month-end; otherwise use original day (capped)
+        if is_month_end:
+            day = target_month_last_day
+        else:
+            day = min(date.day, target_month_last_day)
+
+        return datetime(year, month, day)
