@@ -1,0 +1,32 @@
+# Ignore Excel files in Input Files/PD directory
+Input Files/PD/*.xlsx
+Input Files/PD/*.xls
+Input Files/PD/*.xlsm
+
+# Ignore Excel files in Output/PD directory
+Output/PD/*.xlsx
+Output/PD/*.xls
+Output/PD/*.xlsm
+
+# Keep these files (they won't be ignored)
+# Input Files/PD/Input.py
+# Input Files/PD/latest_month.txt
+# Output/PD/test.py
+
+# Optional: Ignore other common files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store

@@ -1113,3 +1113,357 @@ class ExcelPortfolioAutomation:
             day = min(date.day, target_month_last_day)
 
         return datetime(year, month, day)
+
+    # =============================================================================
+    # PIVOT TABLE & HISTORIC PD METHODS
+    # =============================================================================
+
+    def extract_pivot_table_to_dataframe(self, sheet_name: str, 
+                                        start_cell: str = 'A4',
+                                        contract_col: str = 'A',
+                                        pd_category_col: str = 'B',
+                                        first_data_col: str = 'C') -> pd.DataFrame:
+        """
+        Extract pivot table data from a sheet to DataFrame.
+        Assumes pivot structure:
+        - Column A: CONTRACT_NO_NOLASTDIG
+        - Column B: PD_CATEGORY  
+        - Column C onwards: Date columns (e.g., 2024-09, 2024-10, etc.)
+
+        Args:
+            sheet_name: Name of the sheet containing pivot table
+            start_cell: Starting cell of pivot data (default: 'A4')
+            contract_col: Column letter for contract numbers (default: 'A')
+            pd_category_col: Column letter for PD category (default: 'B')
+            first_data_col: First data column letter (default: 'C')
+
+        Returns:
+            pd.DataFrame: Pivot data with multi-index (CONTRACT_NO_NOLASTDIG, PD_CATEGORY) 
+                         and date columns
+        """
+        print(f"\n   Extracting pivot table from '{sheet_name}'...")
+        
+        sheet = self.workbook.sheets[sheet_name]
+        
+        # Read the entire used range
+        used_range = sheet.used_range
+        data = used_range.value
+        
+        if not data or len(data) < 4:
+            print(f"   ERROR: No data found in sheet '{sheet_name}'")
+            return pd.DataFrame()
+        
+        # Find header row (row with date columns like "2024-09")
+        header_row_idx = None
+        for i, row in enumerate(data):
+            if row and len(row) > 2:
+                # Check if row has date-like values (YYYY-MM format)
+                for cell in row[2:]:  # Skip first 2 columns
+                    if cell and isinstance(cell, str) and re.match(r'\d{4}-\d{2}', str(cell)):
+                        header_row_idx = i
+                        break
+                if header_row_idx is not None:
+                    break
+        
+        if header_row_idx is None:
+            print(f"   ERROR: Could not find header row with date columns")
+            return pd.DataFrame()
+        
+        print(f"   Found header row at index: {header_row_idx}")
+        
+        # Extract headers (date columns)
+        headers = ['CONTRACT_NO_NOLASTDIG', 'PD_CATEGORY']
+        date_headers = []
+        for cell in data[header_row_idx][2:]:  # Skip first 2 columns
+            if cell:
+                headers.append(str(cell))
+                date_headers.append(str(cell))
+            else:
+                break  # Stop at first empty column
+        
+        print(f"   Found {len(date_headers)} date columns: {date_headers[:5]}...")
+        
+        # Extract data rows (start from row after header)
+        data_rows = []
+        for row in data[header_row_idx + 1:]:
+            if row and row[0]:  # If first column has value (contract number)
+                # Take only the columns we need (up to length of headers)
+                row_data = row[:len(headers)]
+                data_rows.append(row_data)
+        
+        print(f"   Extracted {len(data_rows)} data rows")
+        
+        # Create DataFrame
+        df = pd.DataFrame(data_rows, columns=headers)
+        
+        # Filter out empty rows
+        df = df[df['CONTRACT_NO_NOLASTDIG'].notna()]
+        df = df[df['PD_CATEGORY'].notna()]
+        
+        print(f"   Final DataFrame: {len(df)} rows x {len(df.columns)} columns")
+        print(f"{df.head}")
+        
+        return df
+
+    @staticmethod
+    def convert_pivot_date_to_year_month(date_str: str) -> tuple:
+        """
+        Convert pivot date format to year and month name.
+        
+        Args:
+            date_str: Date string in format "YYYY-MM" (e.g., "2024-09")
+        
+        Returns:
+            tuple: (year, month_name) e.g., (2024, "Sep")
+        """
+        try:
+            # Parse the date string
+            parts = date_str.split('-')
+            year = int(parts[0])
+            month_num = int(parts[1])
+            
+            # Convert month number to name
+            month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                          'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+            month_name = month_names[month_num - 1]
+            
+            return (year, month_name)
+        except:
+            return (None, None)
+
+    def write_historic_pd_format(self, sheet_name: str, pivot_df: pd.DataFrame,
+                                year_row: int = 1, month_row: int = 2, data_start_row: int = 3,
+                                contract_col: str = 'A', pd_category_col: str = 'B') -> None:
+        """
+        Write pivot data to Historic PD sheet format using direct positional mapping.
+
+        Dynamically writes:
+        - Row 1: Year headers (e.g., 2024 for C1:G1, 2025 for H1:O1)
+        - Row 2: Month abbreviation headers (e.g., Aug, Sep, ..., Jul, Aug)
+        - Row 3+: Data (CONTRACT_NO_NOLASTDIG in col A, PD_CATEGORY in col B, values in C:O)
+
+        Mapping is positional: first pivot date column -> col C, second -> col D, etc.
+        Total months is always 13.
+
+        Args:
+            sheet_name: Name of the sheet to update
+            pivot_df: DataFrame with pivot data (from extract_pivot_table_to_dataframe)
+            year_row: Row number for years (default: 1)
+            month_row: Row number for month names (default: 2)
+            data_start_row: First data row (default: 3)
+            contract_col: Column letter for contract numbers (default: 'A')
+            pd_category_col: Column letter for PD category (default: 'B')
+        """
+        print(f"\n   Writing data to '{sheet_name}'...")
+
+        sheet = self.workbook.sheets[sheet_name]
+
+        # Get date columns from pivot DataFrame (only YYYY-MM format columns)
+        date_columns = [col for col in pivot_df.columns
+                       if col not in ['CONTRACT_NO_NOLASTDIG', 'PD_CATEGORY']
+                       and re.match(r'\d{4}-\d{2}', str(col))]
+
+        if not date_columns:
+            print(f"   ERROR: No date columns found in pivot data")
+            return
+
+        print(f"   Date columns ({len(date_columns)}): {date_columns}")
+
+        # Parse each date column to extract year and month abbreviation
+        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+        year_headers = []
+        month_headers = []
+
+        for date_col in date_columns:
+            parts = str(date_col).split('-')
+            year = int(parts[0])
+            month_num = int(parts[1])
+            year_headers.append(year)
+            month_headers.append(month_names[month_num - 1])
+
+        print(f"   Year headers: {year_headers}")
+        print(f"   Month headers: {month_headers}")
+
+        # Column C = 3 (first data column)
+        first_data_col_num = 3
+        last_data_col_letter = self._col_number_to_letter(first_data_col_num + len(date_columns) - 1)
+
+        # Disable screen updating, auto-calculation, alerts, and events for performance
+        print(f"   Disabling screen updating and auto-calculation...")
+        self.app.screen_updating = False
+        original_calculation = self.app.api.Calculation
+        self.app.api.Calculation = -4135  # xlCalculationManual
+        self.app.api.DisplayAlerts = False
+        self.app.api.EnableEvents = False
+
+        try:
+            # Step 1: Write year headers to Row 1 (C1 onwards)
+            print(f"   Writing year headers to row {year_row} (C{year_row}:{last_data_col_letter}{year_row})...")
+
+            # Clear contents first, then unmerge (avoids dialog prompts on merged cells)
+            year_range = sheet.range(f'C{year_row}:{last_data_col_letter}{year_row}')
+            year_range.clear_contents()
+            try:
+                year_range.api.UnMerge()
+            except:
+                pass
+
+            # Write all year values at once (batch - cells are now unmerged)
+            sheet.range(f'C{year_row}').value = [year_headers]
+            print(f"   Year values written")
+
+            # Merge consecutive columns that share the same year
+            i = 0
+            while i < len(year_headers):
+                j = i + 1
+                while j < len(year_headers) and year_headers[j] == year_headers[i]:
+                    j += 1
+                if j - i > 1:
+                    start_col = self._col_number_to_letter(first_data_col_num + i)
+                    end_col = self._col_number_to_letter(first_data_col_num + j - 1)
+                    merge_range = f'{start_col}{year_row}:{end_col}{year_row}'
+                    sheet.range(merge_range).api.Merge()
+                    print(f"     Merged {merge_range} = {year_headers[i]}")
+                i = j
+
+            # Step 2: Write month abbreviation headers to Row 2 (C2 onwards)
+            print(f"   Writing month headers to row {month_row} (C{month_row}:{last_data_col_letter}{month_row})...")
+            sheet.range(f'C{month_row}').value = [month_headers]
+
+            # Step 3: Clear existing data from data_start_row down (including formula cols P-S)
+            last_row = sheet.range(f'{contract_col}{data_start_row}').end('down').row
+            if last_row < 1000000 and last_row >= data_start_row:
+                clear_range = f'{contract_col}{data_start_row}:S{last_row}'
+                print(f"   Clearing data range {clear_range}...")
+                sheet.range(clear_range).clear_contents()
+
+            if pivot_df.empty:
+                print(f"   No data to write")
+                return
+
+            num_rows = len(pivot_df)
+            print(f"   Writing {num_rows} rows of data starting at row {data_start_row}...")
+
+            # Step 4: Write CONTRACT_NO_NOLASTDIG to column A
+            print(f"   Writing column A (CONTRACT_NO)...")
+            contract_values = pivot_df['CONTRACT_NO_NOLASTDIG'].values.reshape(-1, 1).tolist()
+            sheet.range(f'{contract_col}{data_start_row}').value = contract_values
+
+            # Step 5: Write PD_CATEGORY to column B
+            print(f"   Writing column B (PD_CATEGORY)...")
+            category_values = pivot_df['PD_CATEGORY'].values.reshape(-1, 1).tolist()
+            sheet.range(f'{pd_category_col}{data_start_row}').value = category_values
+
+            # Step 6: Write all date values at once (columns C through last_data_col)
+            print(f"   Writing columns C-{last_data_col_letter} (date values)...")
+            data_values = pivot_df[date_columns].values.tolist()
+            sheet.range(f'C{data_start_row}').value = data_values
+
+            print(f"   Successfully wrote {num_rows} rows x {len(date_columns) + 2} columns")
+            print(f"   Year headers: Row {year_row} (C-{last_data_col_letter})")
+            print(f"   Month headers: Row {month_row} (C-{last_data_col_letter})")
+            print(f"   Data: Rows {data_start_row}-{data_start_row + num_rows - 1} (A-{last_data_col_letter})")
+
+            # Step 7: Write formulas to columns P, Q, R, S
+            last_data_row = data_start_row + num_rows - 1
+            r = data_start_row  # first formula row
+            lcl = last_data_col_letter  # e.g. 'O'
+            print(f"   Writing formulas to columns P-S (rows {r}-{last_data_row})...")
+
+            # Set formulas in the first data row
+            sheet.range(f'P{r}').formula = f'=SUM(C{r}:{lcl}{r})'
+            sheet.range(f'Q{r}').formula = f'=MAX(C{r}:{lcl}{r})'
+            sheet.range(f'R{r}').formula = f'=INDEX(C{r}:{lcl}{r},MATCH(TRUE,INDEX((C{r}:{lcl}{r}<>""),0),0))'
+            sheet.range(f'S{r}').formula = f'=LOOKUP(2,1/(C{r}:{lcl}{r}<>""),C{r}:{lcl}{r})'
+
+            # AutoFill down to last data row (single native Excel call)
+            if last_data_row > data_start_row:
+                source = sheet.range(f'P{r}:S{r}')
+                dest = sheet.range(f'P{r}:S{last_data_row}')
+                source.api.AutoFill(Destination=dest.api, Type=0)  # xlFillDefault
+
+            print(f"   Formulas written to P{r}:S{last_data_row}")
+
+        finally:
+            # Re-enable screen updating, auto-calculation, alerts, and events
+            print(f"   Re-enabling screen updating and auto-calculation...")
+            self.app.api.EnableEvents = True
+            self.app.api.DisplayAlerts = True
+            self.app.api.Calculation = original_calculation
+            self.app.screen_updating = True
+
+        print(f"   Historic PD update complete!")
+    
+    def _col_number_to_letter(self, col_num: int) -> str:
+        """Convert column number to Excel column letter (e.g., 1->A, 27->AA)"""
+        result = ""
+        while col_num > 0:
+            col_num -= 1
+            result = chr(col_num % 26 + 65) + result
+            col_num //= 26
+        return result
+
+    @staticmethod
+    def copy_pivot_to_historic(latest_pd_file: str, 
+                              input_folder: str,
+                              output_folder: str,
+                              historic_filename: str = "02. Historic PD Calculation 2024-25.xlsb",
+                              pivot_sheet: str = "01.Pivoted_Portfolio",
+                              historic_sheet: str = "02.Working") -> str:
+        """
+        Complete workflow to copy pivot data to historic PD format.
+        
+        Args:
+            latest_pd_file: Path to the latest PD file with pivot data
+            input_folder: Folder containing the original historic file
+            output_folder: Folder to save the updated historic file
+            historic_filename: Name of the historic file (default: "02. Historic PD Calculation 2024-25.xlsb")
+            pivot_sheet: Sheet name with pivot data (default: "01.Pivoted_Portfolio")
+            historic_sheet: Sheet name to write historic format (default: "02.Working")
+        
+        Returns:
+            str: Path to the saved historic file
+        """
+        print("\n" + "="*80)
+        print("COPYING PIVOT TO HISTORIC PD FORMAT")
+        print("="*80)
+        
+        historic_input_file = os.path.join(input_folder, historic_filename)
+        
+        # Step 1: Extract pivot data from latest PD file
+        print(f"\n1. Opening PD file to extract pivot...")
+        print(f"   File: {os.path.basename(latest_pd_file)}")
+        
+        with ExcelPortfolioAutomation(latest_pd_file, visible=True) as excel:
+            pivot_df = excel.extract_pivot_table_to_dataframe(pivot_sheet)
+            
+            if pivot_df.empty:
+                print("\n   ERROR: No pivot data extracted!")
+                return None
+        
+        print(f"   Extracted pivot data: {len(pivot_df)} rows")
+        
+        # Step 2: Open historic file and write data
+        print(f"\n2. Opening Historic PD file...")
+        print(f"   File: {os.path.basename(historic_input_file)}")
+        
+        with ExcelPortfolioAutomation(historic_input_file, visible=True) as excel:
+            # Write in historic format
+            excel.write_historic_pd_format(historic_sheet, pivot_df)
+            
+            # Save as new file with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_filename = historic_filename.replace(".xlsb", f"_Updated_{timestamp}.xlsb")
+            output_file = os.path.join(output_folder, output_filename)
+            
+            excel.save_as(output_file)
+            print(f"\n3. Saved Historic file:")
+            print(f"   {output_file}")
+        
+        print("\n" + "="*80)
+        print("HISTORIC PD UPDATE COMPLETED!")
+        print("="*80)
+        
+        return output_file
