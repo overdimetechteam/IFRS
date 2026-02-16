@@ -1196,9 +1196,11 @@ class ExcelPortfolioAutomation:
         # Create DataFrame
         df = pd.DataFrame(data_rows, columns=headers)
         
-        # Filter out empty rows
+        # Filter out empty rows and pivot artifacts like (blank) and Grand Total
         df = df[df['CONTRACT_NO_NOLASTDIG'].notna()]
+        df = df[~df['CONTRACT_NO_NOLASTDIG'].astype(str).str.strip().isin(['(blank)', 'blank', '', 'Grand Total'])]
         df = df[df['PD_CATEGORY'].notna()]
+        df = df[~df['PD_CATEGORY'].astype(str).str.strip().isin(['(blank)', 'blank', '', 'Grand Total'])]
         
         print(f"   Final DataFrame: {len(df)} rows x {len(df.columns)} columns")
         print(f"{df.head}")
@@ -1332,6 +1334,10 @@ class ExcelPortfolioAutomation:
             print(f"   Writing month headers to row {month_row} (C{month_row}:{last_data_col_letter}{month_row})...")
             sheet.range(f'C{month_row}').value = [month_headers]
 
+            # Write DC Bucket header to S2 (only S2, preserve original P2:R2 headers)
+            sheet.range(f'S{month_row}').value = 'DC Bucket'
+            print(f"   DC Bucket header written to S{month_row}")
+
             # Step 3: Clear existing data from data_start_row down (including formula cols P-S)
             last_row = sheet.range(f'{contract_col}{data_start_row}').end('down').row
             if last_row < 1000000 and last_row >= data_start_row:
@@ -1405,8 +1411,233 @@ class ExcelPortfolioAutomation:
             col_num //= 26
         return result
 
+    def setup_historic_pivot_tables(self, pivot_sheet_name: str, data_sheet_name: str,
+                                 big_pivot_name: str, small_pivot_name: str,
+                                 last_month_field: str, last_data_row: int) -> None:
+        """
+        Set up pivot tables in Historic PD file after data write.
+
+        Steps:
+        1. Delete 'Select PD Category' slicer
+        2. Select E4 (PivotTable2) > Change Data Source to 02.Working
+        3. Select O4 (PivotTable1) > Change Data Source to 02.Working
+        4. Refresh PivotTable2 then PivotTable1
+        5. Select O4 (PivotTable1) > Field List > drag last month to Rows
+        6. Click O4 > filter > untick (blank)
+        """
+        import time
+        import win32com.client
+
+        print(f"\n   Setting up pivot tables in '{pivot_sheet_name}'...")
+
+        pivot_sheet = self.workbook.sheets[pivot_sheet_name]
+        source_range = f"'{data_sheet_name}'!$A$2:$S${last_data_row}"
+
+        try:
+            # ====================================================================
+            # Step 1: Delete Select PD Category slicer
+            # ====================================================================
+            print(f"   Step 1: Deleting existing slicers...")
+            try:
+                while self.workbook.api.SlicerCaches.Count > 0:
+                    self.workbook.api.SlicerCaches(1).Delete()
+                print(f"     Slicers deleted")
+            except Exception as e:
+                print(f"     No slicers to delete: {e}")
+
+            # ====================================================================
+            # Step 2: Select E4 (PivotTable2) and change data source
+            # ====================================================================
+            print(f"   Step 2: Selecting E4 ({big_pivot_name}) > Change Data Source...")
+            pivot_sheet.range("E4").select()
+            big_pt = pivot_sheet.api.PivotTables(big_pivot_name)
+            new_cache_big = self.workbook.api.PivotCaches().Create(
+                SourceType=1, SourceData=source_range
+            )
+            big_pt.ChangePivotCache(new_cache_big)
+            print(f"     {big_pivot_name} source updated to {source_range}")
+
+            # ====================================================================
+            # Step 3: Select O4 (PivotTable1) and change data source
+            # ====================================================================
+            print(f"   Step 3: Selecting O4 ({small_pivot_name}) > Change Data Source...")
+            pivot_sheet.range("O4").select()
+            small_pt = pivot_sheet.api.PivotTables(small_pivot_name)
+            new_cache_small = self.workbook.api.PivotCaches().Create(
+                SourceType=1, SourceData=source_range
+            )
+            small_pt.ChangePivotCache(new_cache_small)
+            print(f"     {small_pivot_name} source updated to {source_range}")
+
+            # ====================================================================
+            # Step 4: Refresh PivotTable2 then PivotTable1
+            # ====================================================================
+            print(f"   Step 4: Refreshing pivots...")
+            self.refresh_pivot_table(pivot_sheet_name, big_pivot_name)
+            self.refresh_pivot_table(pivot_sheet_name, small_pivot_name)
+            print(f"     Both pivots refreshed")
+
+            # ====================================================================
+            # Use win32com directly for Steps 5-6
+            # (bypasses xlwings COMRetryMethodWrapper that blocks PivotFields)
+            # ====================================================================
+            excel_com = win32com.client.GetActiveObject("Excel.Application")
+            ws_com = excel_com.ActiveWorkbook.Worksheets(pivot_sheet_name)
+            small_pt_com = ws_com.PivotTables(small_pivot_name)
+
+            def _get_field(pt, name):
+                try:
+                    return pt.PivotFields(name)
+                except (TypeError, AttributeError):
+                    return pt.PivotFields.Item(name)
+
+            def _get_item(pivot_items, idx):
+                try:
+                    return pivot_items(idx)
+                except (TypeError, AttributeError):
+                    return pivot_items.Item(idx)
+
+            # ====================================================================
+            # Step 5: Select O4 (PivotTable1) > Field List > drag last month
+            #         (e.g. Sep2) to Rows area, then wait 3 seconds
+            # ====================================================================
+            print(f"   Step 5: Adding '{last_month_field}' to {small_pivot_name} Rows...")
+            pivot_sheet.range("O4").select()
+            field = _get_field(small_pt_com, last_month_field)
+            try:
+                field.Orientation = 1  # xlRowField
+                print(f"     '{last_month_field}' added to Rows")
+            except Exception as e:
+                print(f"     Error adding field: {e}")
+                import traceback
+                traceback.print_exc()
+
+            print(f"     Waiting 3 seconds...")
+            time.sleep(3)
+
+            # ====================================================================
+            # Step 6: Filter (blank) out of the small pivot via Filters trick
+            #   6a. Click O4 (PivotTable1)
+            #   6b. Drag Sep2 from Rows → Filters
+            #   6c. Click P2 filter, tick "Select Multiple Items"
+            #   6d. Untick (blank), hit OK
+            #   6e. Drag Sep2 from Filters → back to Rows
+            # ====================================================================
+            print(f"   Step 6: Filtering (blank) via Filters on {small_pivot_name}...")
+
+            # 6a. Click O4
+            pivot_sheet.range("O4").select()
+            time.sleep(1)
+
+            # 6b. Move Sep2 from Rows to Filters (Page field)
+            print(f"     Moving '{last_month_field}' from Rows to Filters...")
+            try:
+                field.Orientation = 3  # xlPageField (Filters area)
+                print(f"     '{last_month_field}' moved to Filters")
+            except Exception as e:
+                print(f"     Error moving to Filters: {e}")
+                import traceback
+                traceback.print_exc()
+            time.sleep(1)
+
+            # 6c. Click P2 (filter dropdown) and enable Select Multiple Items
+            print(f"     Enabling Select Multiple Items...")
+            pivot_sheet.range("P2").select()
+            try:
+                field.EnableMultiplePageItems = True
+                print(f"     Select Multiple Items enabled")
+            except Exception as e:
+                print(f"     Error enabling multi-select: {e}")
+                import traceback
+                traceback.print_exc()
+            time.sleep(1)
+
+            # 6d. Untick (blank) from items: 1, 2, 3, 4, 5, (blank)
+            print(f"     Unticking (blank)...")
+            try:
+                try:
+                    pi_items = field.PivotItems()
+                except TypeError:
+                    pi_items = field.PivotItems
+                item_count = pi_items.Count
+                print(f"     '{last_month_field}' has {item_count} items")
+
+                blank_hidden = False
+                for i in range(1, item_count + 1):
+                    try:
+                        pi = _get_item(pi_items, i)
+                        name = str(pi.Name)
+                        print(f"       Item {i}: '{name}'")
+                        if name.lower() in ['(blank)', 'blank', '']:
+                            print(f"     >>> Unticked: '{name}'")
+                            pi.Visible = False
+                            blank_hidden = True
+                    except Exception as e:
+                        print(f"       Error with item {i}: {e}")
+
+                # Fallback: blank is typically the last item
+                if not blank_hidden and item_count > 1:
+                    try:
+                        pi = _get_item(pi_items, item_count)
+                        print(f"     >>> FALLBACK: Unticking item {item_count} '{pi.Name}'")
+                        pi.Visible = False
+                    except Exception as e:
+                        print(f"     Fallback failed: {e}")
+
+                print(f"     (blank) unticked")
+
+            except Exception as e:
+                print(f"     ERROR unticking (blank): {e}")
+                import traceback
+                traceback.print_exc()
+            time.sleep(1)
+
+            # 6e. Move Sep2 from Filters back to Rows
+            print(f"     Moving '{last_month_field}' from Filters back to Rows...")
+            try:
+                field.Orientation = 1  # xlRowField
+                print(f"     '{last_month_field}' back in Rows")
+            except Exception as e:
+                print(f"     Error moving back to Rows: {e}")
+                import traceback
+                traceback.print_exc()
+            time.sleep(1)
+
+            # ====================================================================
+            # Step 7: Click big pivot > Insert Slicer > tick PD_CATEGORY
+            #         Move slicer next to big pivot
+            # ====================================================================
+            print(f"   Step 7: Adding PD_CATEGORY slicer to {big_pivot_name}...")
+            pivot_sheet.range("E4").select()
+            try:
+                slicer_cache = self.workbook.api.SlicerCaches.Add2(big_pt, "PD_CATEGORY")
+                slicer = slicer_cache.Slicers.Add(pivot_sheet.api)
+                slicer.Caption = "Select PD Category"
+
+                # Position slicer next to the big pivot (to its right)
+                big_pt_range = big_pt.TableRange2
+                slicer.Width = 144
+                slicer.Height = 200
+                slicer.Left = big_pt_range.Left + big_pt_range.Width + 10
+                slicer.Top = big_pt_range.Top
+
+                print(f"     PD_CATEGORY slicer added next to {big_pivot_name}")
+
+            except Exception as e:
+                print(f"     ERROR adding slicer: {e}")
+                import traceback
+                traceback.print_exc()
+
+        except Exception as e:
+            print(f"\n   FATAL ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+        print(f"\n   Pivot setup complete!")
+
     @staticmethod
-    def copy_pivot_to_historic(latest_pd_file: str, 
+    def copy_pivot_to_historic(latest_pd_file: str,
                               input_folder: str,
                               output_folder: str,
                               historic_filename: str = "02. Historic PD Calculation 2024-25.xlsb",
@@ -1452,14 +1683,37 @@ class ExcelPortfolioAutomation:
         with ExcelPortfolioAutomation(historic_input_file, visible=True) as excel:
             # Write in historic format
             excel.write_historic_pd_format(historic_sheet, pivot_df)
-            
+
+            # Step 3: Set up pivot tables in 03.PD_Pivot
+            print(f"\n3. Setting up pivot tables...")
+
+            # Compute last month field name from pivot date columns
+            date_columns = [col for col in pivot_df.columns
+                           if col not in ['CONTRACT_NO_NOLASTDIG', 'PD_CATEGORY']
+                           and re.match(r'\d{4}-\d{2}', str(col))]
+            last_date = date_columns[-1]  # e.g., '2025-09'
+            month_num = int(last_date.split('-')[1])
+            month_names_list = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                               'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+            last_month_field = f"{month_names_list[month_num - 1]}2"  # e.g., 'Sep2'
+            last_data_row = 3 + len(pivot_df) - 1  # data starts at row 3
+
+            excel.setup_historic_pivot_tables(
+                pivot_sheet_name="03.PD_Pivot",
+                data_sheet_name=historic_sheet,
+                big_pivot_name="PivotTable2",
+                small_pivot_name="PivotTable1",
+                last_month_field=last_month_field,
+                last_data_row=last_data_row
+            )
+
             # Save as new file with timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_filename = historic_filename.replace(".xlsb", f"_Updated_{timestamp}.xlsb")
             output_file = os.path.join(output_folder, output_filename)
-            
+
             excel.save_as(output_file)
-            print(f"\n3. Saved Historic file:")
+            print(f"\n4. Saved Historic file:")
             print(f"   {output_file}")
         
         print("\n" + "="*80)
