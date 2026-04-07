@@ -620,14 +620,16 @@ class ExcelPortfolioAutomation:
 
     def read_portfolio_data(self, sheet_name: str) -> pd.DataFrame:
         """
-        Read portfolio data from a sheet (reads all columns as-is).
-        Instance method that uses the current workbook.
+        Read portfolio data from a sheet.
+        Reads only data columns (A:B, D:F) in chunks to avoid COM errors
+        on large sheets or formula columns (column C is skipped).
 
         Args:
             sheet_name: Name of the portfolio sheet to read
 
         Returns:
-            pd.DataFrame: Portfolio data with all columns
+            pd.DataFrame: Portfolio data with columns MONTH, CONTRACT_NO,
+                          EQT_DESC, PD_CATEGORY, DPD
         """
         sheet = self.workbook.sheets[sheet_name]
         last_row = sheet.range('A2').end('down').row
@@ -637,23 +639,59 @@ class ExcelPortfolioAutomation:
             print(f"   {sheet_name}: Empty sheet detected")
             return pd.DataFrame()
 
-        # Read entire used range to preserve all columns
-        df = self.read_sheet_range_to_dataframe(sheet_name, None)
+        print(f"   Reading data from sheet '{sheet_name}' ({last_row - 1} rows)...")
+
+        CHUNK_SIZE = 50000
+        ab_data = []   # columns A, B
+        def_data = []  # columns D, E, F
+
+        for start in range(2, last_row + 1, CHUNK_SIZE):
+            end = min(start + CHUNK_SIZE - 1, last_row)
+
+            # A:B  (MONTH, CONTRACT_NO)
+            chunk_ab = sheet.range(f'A{start}:B{end}').value
+            if chunk_ab is not None:
+                if not isinstance(chunk_ab[0], list):
+                    chunk_ab = [chunk_ab]
+                ab_data.extend(chunk_ab)
+
+            # D:F  (EQT_DESC, PD_CATEGORY, DPD) — skip formula column C
+            chunk_def = sheet.range(f'D{start}:F{end}').value
+            if chunk_def is not None:
+                if not isinstance(chunk_def[0], list):
+                    chunk_def = [chunk_def]
+                def_data.extend(chunk_def)
+
+        if not ab_data:
+            return pd.DataFrame()
+
+        df_left  = pd.DataFrame(ab_data,  columns=['MONTH', 'CONTRACT_NO'])
+        df_right = pd.DataFrame(def_data, columns=['EQT_DESC', 'PD_CATEGORY', 'DPD'])
+        df = pd.concat([df_left, df_right], axis=1)
+
+        # Drop rows where both key fields are blank
+        df = df[df['MONTH'].notna() & df['CONTRACT_NO'].notna()]
+
+        print(f"    Successfully read {len(df)} rows")
         return df
 
-    def write_portfolio_data(self, sheet_name: str, df: pd.DataFrame, 
+    def write_portfolio_data(self, sheet_name: str, df: pd.DataFrame,
                             columns_to_write: List[str],
-                            column_positions: dict = None) -> None:
+                            column_positions: dict = None,
+                            full_clear: bool = False) -> None:
         """
         Write specific columns to Portfolio sheet at specified positions.
-        Leaves formula columns untouched.
 
         Args:
             sheet_name: Name of the portfolio sheet
             df: DataFrame containing data to write
-            columns_to_write: List of column names to write (e.g., ['MONTH', 'CONTRACT_NO', ...])
-            column_positions: Dict mapping column names to Excel columns (e.g., {'MONTH': 'A', 'CONTRACT_NO': 'B'})
-                            If None, uses default mapping: A=MONTH, B=CONTRACT_NO, D=EQT_DESC, E=PD_CATEGORY, F=DPD
+            columns_to_write: List of column names to write
+            column_positions: Dict mapping column names to Excel columns.
+                              Defaults to A=MONTH, B=CONTRACT_NO, D=EQT_DESC, E=PD_CATEGORY, F=DPD
+            full_clear: When True AND df is empty, wipe the entire used range including
+                        formula columns (DC_BUCKET, STAGE, etc.).
+                        When False (default), only clear data columns A:F — preserves
+                        formula columns beyond F (use this for Portfolio_1).
         """
         sheet = self.workbook.sheets[sheet_name]
 
@@ -667,20 +705,45 @@ class ExcelPortfolioAutomation:
                 'DPD': 'F'
             }
 
-        # Clear only the specified data columns (skip formula columns)
-        last_row = sheet.range('A2').end('down').row
-        if last_row < 1000000:  # Has data
+        if df.empty:
+            if full_clear:
+                # Nuclear clear: wipe entire used range from row 2 down
+                # Removes DC_BUCKET, STAGE, and every other formula column
+                used = sheet.used_range
+                if used is not None:
+                    last_row = used.last_cell.row
+                    last_col = used.last_cell.column
+                    if last_row >= 2 and last_col >= 1:
+                        last_col_letter = self._col_number_to_letter(last_col)
+                        sheet.range(f'A2:{last_col_letter}{last_row}').clear_contents()
+                        print(f"  {sheet_name}: Fully cleared (A2:{last_col_letter}{last_row})")
+                        return
+                print(f"  {sheet_name}: Already empty — nothing to clear")
+            else:
+                # Partial clear: A:F and H (STAGE values) — keeps G (DC_BUCKET formula)
+                last_row_a = sheet.range('A2').end('down').row
+                last_row_c = sheet.range('C2').end('down').row
+                candidates = [r for r in [last_row_a, last_row_c] if r < 1000000]
+                last_row = max(candidates) if candidates else 0
+                if last_row > 0:
+                    sheet.range(f'A2:F{last_row}').clear_contents()
+                    sheet.range(f'H2:H{last_row}').clear_contents()
+                    print(f"  {sheet_name}: Data columns cleared (A2:F{last_row}, H2:H{last_row})")
+                else:
+                    print(f"  {sheet_name}: Already empty — nothing to clear")
+            return
+
+        # Before writing data: clear A:F and H (STAGE values) — preserve G (DC_BUCKET formula)
+        last_row_a = sheet.range('A2').end('down').row
+        last_row_c = sheet.range('C2').end('down').row
+        candidates = [r for r in [last_row_a, last_row_c] if r < 1000000]
+        last_row = max(candidates) if candidates else 0
+        if last_row > 0:
             try:
-                # Clear columns A and B
-                sheet.range(f'A2:B{last_row}').clear_contents()
-                # Clear columns D, E, F (skip C which is formula)
-                sheet.range(f'D2:F{last_row}').clear_contents()
+                sheet.range(f'A2:F{last_row}').clear_contents()
+                sheet.range(f'H2:H{last_row}').clear_contents()
             except:
                 pass
-
-        if df.empty:
-            print(f"  {sheet_name}: No data to write")
-            return
 
         # Write each column to its specified position
         num_rows = len(df)
@@ -869,55 +932,83 @@ class ExcelPortfolioAutomation:
         Returns:
             pd.DataFrame: Consolidated data from all summary files
         """
-        all_data = []
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        for file_path, month_date in file_paths:
+        def _extract_one(file_path, month_date):
+            fname = os.path.basename(file_path)
             try:
-                print(f"  Extracting: {os.path.basename(file_path)}")
-
-                # Find correct header row
-                df = None
+                # --- Step 1: probe only the first row to find the header line ---
+                found_header_row = 0
                 for header_row in range(max_header_search_rows):
                     try:
-                        temp_df = pd.read_excel(file_path, sheet_name=sheet_name,
-                                               header=header_row, engine='pyxlsb')
-                        # Check if any of the source columns exist
-                        if any(col in temp_df.columns for col in column_mapping.keys()):
-                            df = temp_df
+                        probe = pd.read_excel(file_path, sheet_name=sheet_name,
+                                              header=header_row, nrows=1,
+                                              engine='pyxlsb')
+                        if any(col in probe.columns for col in column_mapping.keys()):
+                            found_header_row = header_row
                             break
-                    except:
+                    except Exception:
                         continue
 
-                if df is None:
-                    df = pd.read_excel(file_path, sheet_name=sheet_name,
-                                      header=0, engine='pyxlsb')
+                # --- Step 2: one full read with the correct header row ---
+                df = pd.read_excel(file_path, sheet_name=sheet_name,
+                                   header=found_header_row, engine='pyxlsb')
 
-                # Map columns
+                # Map columns (first non-null match wins — supports multiple src names -> same target)
                 extracted = pd.DataFrame()
                 for src_col, tgt_col in column_mapping.items():
-                    found = None
-                    for col in df.columns:
-                        if str(col).strip().upper() == src_col.upper():
-                            found = col
-                            break
-                    extracted[tgt_col] = df[found] if found else None
+                    found_col = next(
+                        (c for c in df.columns if str(c).strip().upper() == src_col.upper()),
+                        None
+                    )
+                    if found_col is not None:
+                        # Only assign if target not yet set or currently all-null
+                        if tgt_col not in extracted.columns or extracted[tgt_col].isna().all():
+                            extracted[tgt_col] = df[found_col]
+                    elif tgt_col not in extracted.columns:
+                        extracted[tgt_col] = None
+
+                # Diagnostic: report STAGE fill rate so column-name mismatches are visible
+                if 'STAGE' in extracted.columns:
+                    stage_found = int(extracted['STAGE'].notna().sum())
+                    print(f"    STAGE values extracted: {stage_found}/{len(extracted)}"
+                          + (" (column not found in source)" if stage_found == 0 else ""))
 
                 # Add MONTH column
-                extracted['MONTH'] = ExcelPortfolioAutomation.format_month_string(month_date, date_format)
+                extracted['MONTH'] = ExcelPortfolioAutomation.format_month_string(
+                    month_date, date_format)
 
                 # Filter empty rows
-                first_col = list(column_mapping.values())[0]  # Use first target column for filtering
+                first_col = list(column_mapping.values())[0]
                 extracted = extracted[extracted[first_col].notna()]
-                extracted = extracted[~extracted[first_col].astype(str).isin(['', '-', 'nan', 'None'])]
+                extracted = extracted[
+                    ~extracted[first_col].astype(str).isin(['', '-', 'nan', 'None'])]
 
-                # Reorder columns
                 extracted = extracted[output_columns]
-
-                all_data.append(extracted)
-                print(f"    Rows: {len(extracted)}")
+                return fname, len(extracted), extracted, None
 
             except Exception as e:
-                print(f"    ERROR: {e}")
+                return fname, 0, None, e
+
+        print(f"Extracting data from {len(file_paths)} file(s)...")
+        max_workers = min(len(file_paths), 4)  # cap at 4 to avoid memory pressure
+        results_map = {}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_extract_one, fp, md): (fp, md)
+                       for fp, md in file_paths}
+            for fut in as_completed(futures):
+                fname, nrows, df_result, err = fut.result()
+                if err:
+                    print(f"  ERROR {fname}: {err}")
+                else:
+                    print(f"  Extracting: {fname}\n    Rows: {nrows}")
+                    results_map[fname] = df_result
+
+        # Preserve original file order
+        all_data = [results_map[os.path.basename(fp)]
+                    for fp, _ in file_paths
+                    if os.path.basename(fp) in results_map]
 
         if all_data:
             return pd.concat(all_data, ignore_index=True)
@@ -1153,42 +1244,101 @@ class ExcelPortfolioAutomation:
             print(f"   ERROR: No data found in sheet '{sheet_name}'")
             return pd.DataFrame()
         
-        # Find header row (row with date columns like "2024-09")
+        def _to_yyyymm(cell) -> str | None:
+            """
+            Normalise a pivot column header cell to 'YYYY-MM' string.
+            Handles: str 'YYYY-MM', datetime/date objects, Excel date serials (float).
+            Returns None if the cell cannot be recognised as a date.
+            """
+            if cell is None:
+                return None
+            # Already a YYYY-MM string
+            if isinstance(cell, str):
+                s = cell.strip()
+                if re.match(r'^\d{4}-\d{2}', s):
+                    return s[:7]           # keep only YYYY-MM
+                # MM/DD/YYYY or M/D/YYYY (e.g. "04/30/2025") — MONTH field format
+                m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{4})$', s)
+                if m:
+                    return f"{m.group(3)}-{int(m.group(1)):02d}"
+                # Mon-YY or Mon YYYY (e.g. "Apr-25", "Apr 2025") — Excel pivot display
+                m = re.match(r'^([A-Za-z]{3})[-\s](\d{2,4})$', s)
+                if m:
+                    try:
+                        from datetime import datetime as _dt
+                        year_s = m.group(2)
+                        year = int(year_s) + (2000 if len(year_s) == 2 else 0)
+                        month = _dt.strptime(m.group(1), '%b').month
+                        return f"{year}-{month:02d}"
+                    except Exception:
+                        pass
+                return None                # (blank), Grand Total, etc.
+            # datetime / date objects (xlwings returns these for date-typed cells)
+            if hasattr(cell, 'year') and hasattr(cell, 'month'):
+                return f"{cell.year}-{cell.month:02d}"
+            # Excel date serial (float): days since 1899-12-30
+            # Valid financial range: ~29000 (1979) to ~60000 (2064)
+            # Anything outside this range is a row count or other number, not a date
+            if isinstance(cell, (int, float)):
+                if 29000 <= cell <= 60000:
+                    try:
+                        from datetime import datetime as _dt, timedelta as _td
+                        excel_epoch = _dt(1899, 12, 30)
+                        d = excel_epoch + _td(days=int(cell))
+                        return f"{d.year}-{d.month:02d}"
+                    except Exception:
+                        return None
+                return None  # out of valid date serial range
+            return None
+
+        # Find header row — any cell from column 3 onwards that normalises to YYYY-MM
         header_row_idx = None
         for i, row in enumerate(data):
             if row and len(row) > 2:
-                # Check if row has date-like values (YYYY-MM format)
-                for cell in row[2:]:  # Skip first 2 columns
-                    if cell and isinstance(cell, str) and re.match(r'\d{4}-\d{2}', str(cell)):
+                for cell in row[2:]:
+                    if _to_yyyymm(cell) is not None:
                         header_row_idx = i
                         break
                 if header_row_idx is not None:
                     break
-        
+
         if header_row_idx is None:
             print(f"   ERROR: Could not find header row with date columns")
+            # Debug: show first 5 rows to diagnose the format
+            for i, row in enumerate(data[:5]):
+                if row:
+                    preview = [repr(c) for c in row[:8]]
+                    print(f"   Row {i}: {preview}")
             return pd.DataFrame()
-        
+
         print(f"   Found header row at index: {header_row_idx}")
-        
-        # Extract headers (date columns)
+
+        # Extract headers — only keep YYYY-MM date columns; skip (blank), Grand Total, etc.
         headers = ['CONTRACT_NO_NOLASTDIG', 'PD_CATEGORY']
         date_headers = []
-        for cell in data[header_row_idx][2:]:  # Skip first 2 columns
-            if cell:
-                headers.append(str(cell))
-                date_headers.append(str(cell))
-            else:
+        date_col_indices = []  # raw column indices in the data row for each date header
+        for idx, cell in enumerate(data[header_row_idx][2:]):  # Skip first 2 columns
+            if cell is None or (isinstance(cell, str) and cell.strip() == ''):
                 break  # Stop at first empty column
-        
+            ym = _to_yyyymm(cell)
+            if ym is None:
+                if isinstance(cell, str) and cell.strip() == 'Grand Total':
+                    break
+                # skip non-date columns like (blank)
+                continue
+            headers.append(ym)
+            date_headers.append(ym)
+            date_col_indices.append(idx + 2)  # +2 because we enumerate from col index 2
+
         print(f"   Found {len(date_headers)} date columns: {date_headers[:5]}...")
-        
-        # Extract data rows (start from row after header)
+
+        # Extract data rows — use explicit column index mapping to honour skipped columns
         data_rows = []
         for row in data[header_row_idx + 1:]:
             if row and row[0]:  # If first column has value (contract number)
-                # Take only the columns we need (up to length of headers)
-                row_data = row[:len(headers)]
+                row_data = [row[0], row[1]] + [
+                    row[i] if i < len(row) else None for i in date_col_indices
+                ]
                 data_rows.append(row_data)
         
         print(f"   Extracted {len(data_rows)} data rows")
@@ -1292,6 +1442,15 @@ class ExcelPortfolioAutomation:
         first_data_col_num = 3
         last_data_col_letter = self._col_number_to_letter(first_data_col_num + len(date_columns) - 1)
 
+        # Formula columns sit immediately after the last date column
+        # e.g. for 6 months (C-H): I=Sum, J=Max, K=First Value, L=DC Bucket
+        formula_start_col_num = first_data_col_num + len(date_columns)   # 3+6=9 → I
+        sum_col   = self._col_number_to_letter(formula_start_col_num)         # I
+        max_col   = self._col_number_to_letter(formula_start_col_num + 1)     # J
+        first_col = self._col_number_to_letter(formula_start_col_num + 2)     # K
+        dc_col    = self._col_number_to_letter(formula_start_col_num + 3)     # L
+        last_formula_col = self._col_number_to_letter(formula_start_col_num + 3)  # L
+
         # Disable screen updating, auto-calculation, alerts, and events for performance
         print(f"   Disabling screen updating and auto-calculation...")
         self.app.screen_updating = False
@@ -1302,17 +1461,16 @@ class ExcelPortfolioAutomation:
 
         try:
             # Step 1: Write year headers to Row 1 (C1 onwards)
+            # Clear the full old header range C1:S1 to remove leftover headers from prior runs
             print(f"   Writing year headers to row {year_row} (C{year_row}:{last_data_col_letter}{year_row})...")
-
-            # Clear contents first, then unmerge (avoids dialog prompts on merged cells)
-            year_range = sheet.range(f'C{year_row}:{last_data_col_letter}{year_row}')
-            year_range.clear_contents()
+            full_year_range = sheet.range(f'C{year_row}:S{year_row}')
             try:
-                year_range.api.UnMerge()
+                full_year_range.api.UnMerge()
             except:
                 pass
+            full_year_range.clear_contents()
 
-            # Write all year values at once (batch - cells are now unmerged)
+            # Write all year values at once (batch)
             sheet.range(f'C{year_row}').value = [year_headers]
             print(f"   Year values written")
 
@@ -1330,15 +1488,25 @@ class ExcelPortfolioAutomation:
                     print(f"     Merged {merge_range} = {year_headers[i]}")
                 i = j
 
-            # Step 2: Write month abbreviation headers to Row 2 (C2 onwards)
+            # Step 2: Write month abbreviation headers to Row 2 (C2:last_data_col_letter)
+            # Also write A2/B2 headers — pivot source starts at row 2, so ALL columns
+            # must have valid labels or Excel rejects the source range as invalid
             print(f"   Writing month headers to row {month_row} (C{month_row}:{last_data_col_letter}{month_row})...")
+            sheet.range(f'{contract_col}{month_row}').value    = 'CONTRACT_NO_NOLASTDIG'
+            sheet.range(f'{pd_category_col}{month_row}').value = 'PD_CATEGORY'
+            sheet.range(f'C{month_row}:S{month_row}').clear_contents()
             sheet.range(f'C{month_row}').value = [month_headers]
 
-            # Write DC Bucket header to S2 (only S2, preserve original P2:R2 headers)
-            sheet.range(f'S{month_row}').value = 'DC Bucket'
-            print(f"   DC Bucket header written to S{month_row}")
+            # Write formula column headers immediately after month data
+            # Total | WORST | FIRST | LAST
+            sheet.range(f'{sum_col}{month_row}').value   = 'Total'
+            sheet.range(f'{max_col}{month_row}').value   = 'WORST'
+            sheet.range(f'{first_col}{month_row}').value = 'FIRST'
+            sheet.range(f'{dc_col}{month_row}').value    = 'LAST'
+            # Header cells (WORST/FIRST/LAST) keep their existing green color — do not override
+            print(f"   Formula column headers written: {sum_col}=Total, {max_col}=WORST, {first_col}=FIRST, {dc_col}=LAST")
 
-            # Step 3: Clear existing data from data_start_row down (including formula cols P-S)
+            # Step 3: Clear existing data from data_start_row down (A through S — full old range)
             last_row = sheet.range(f'{contract_col}{data_start_row}').end('down').row
             if last_row < 1000000 and last_row >= data_start_row:
                 clear_range = f'{contract_col}{data_start_row}:S{last_row}'
@@ -1362,7 +1530,7 @@ class ExcelPortfolioAutomation:
             category_values = pivot_df['PD_CATEGORY'].values.reshape(-1, 1).tolist()
             sheet.range(f'{pd_category_col}{data_start_row}').value = category_values
 
-            # Step 6: Write all date values at once (columns C through last_data_col)
+            # Step 6: Write date values (columns C through last_data_col_letter)
             print(f"   Writing columns C-{last_data_col_letter} (date values)...")
             data_values = pivot_df[date_columns].values.tolist()
             sheet.range(f'C{data_start_row}').value = data_values
@@ -1372,25 +1540,48 @@ class ExcelPortfolioAutomation:
             print(f"   Month headers: Row {month_row} (C-{last_data_col_letter})")
             print(f"   Data: Rows {data_start_row}-{data_start_row + num_rows - 1} (A-{last_data_col_letter})")
 
-            # Step 7: Write formulas to columns P, Q, R, S
+            # Step 7: Write formulas to dynamic formula columns (I,J,K,L for 6 months)
             last_data_row = data_start_row + num_rows - 1
-            r = data_start_row  # first formula row
-            lcl = last_data_col_letter  # e.g. 'O'
-            print(f"   Writing formulas to columns P-S (rows {r}-{last_data_row})...")
+            r   = data_start_row       # first formula row
+            lcl = last_data_col_letter  # e.g. 'H' for 6 months
+            print(f"   Writing formulas to columns {sum_col}-{last_formula_col} (rows {r}-{last_data_row})...")
 
             # Set formulas in the first data row
-            sheet.range(f'P{r}').formula = f'=SUM(C{r}:{lcl}{r})'
-            sheet.range(f'Q{r}').formula = f'=MAX(C{r}:{lcl}{r})'
-            sheet.range(f'R{r}').formula = f'=INDEX(C{r}:{lcl}{r},MATCH(TRUE,INDEX((C{r}:{lcl}{r}<>""),0),0))'
-            sheet.range(f'S{r}').formula = f'=LOOKUP(2,1/(C{r}:{lcl}{r}<>""),C{r}:{lcl}{r})'
+            sheet.range(f'{sum_col}{r}').formula   = f'=SUM(C{r}:{lcl}{r})'
+            sheet.range(f'{max_col}{r}').formula   = f'=MAX(C{r}:{lcl}{r})'
+            sheet.range(f'{first_col}{r}').formula = f'=INDEX(C{r}:{lcl}{r},MATCH(TRUE,INDEX((C{r}:{lcl}{r}<>""),0),0))'
+            sheet.range(f'{dc_col}{r}').formula    = f'=LOOKUP(2,1/(C{r}:{lcl}{r}<>""),C{r}:{lcl}{r})'
 
-            # AutoFill down to last data row (single native Excel call)
+            # AutoFill down to last data row
             if last_data_row > data_start_row:
-                source = sheet.range(f'P{r}:S{r}')
-                dest = sheet.range(f'P{r}:S{last_data_row}')
+                source = sheet.range(f'{sum_col}{r}:{last_formula_col}{r}')
+                dest   = sheet.range(f'{sum_col}{r}:{last_formula_col}{last_data_row}')
                 source.api.AutoFill(Destination=dest.api, Type=0)  # xlFillDefault
 
-            print(f"   Formulas written to P{r}:S{last_data_row}")
+            print(f"   Formulas written to {sum_col}{r}:{last_formula_col}{last_data_row}")
+
+            # Step 8: Apply light yellow fill to WORST, FIRST, LAST data rows
+            # Header row keeps its existing green color
+            light_yellow = (255, 255, 204)
+            sheet.range(f'{max_col}{data_start_row}:{max_col}{last_data_row}').color   = light_yellow
+            sheet.range(f'{first_col}{data_start_row}:{first_col}{last_data_row}').color = light_yellow
+            sheet.range(f'{dc_col}{data_start_row}:{dc_col}{last_data_row}').color     = light_yellow
+            print(f"   Light yellow fill applied to {max_col}:{dc_col} data rows")
+
+            # Step 10: Delete any extra columns to the right of the last formula column
+            # These are leftover from previous runs that had more month columns
+            last_formula_col_num = formula_start_col_num + 3  # e.g. L = 12
+            last_used_col = sheet.used_range.last_cell.column
+            if last_used_col > last_formula_col_num:
+                delete_start_letter = self._col_number_to_letter(last_formula_col_num + 1)
+                delete_end_letter   = self._col_number_to_letter(last_used_col)
+                print(f"   Deleting extra columns {delete_start_letter}:{delete_end_letter}...")
+                sheet.range(
+                    f'{delete_start_letter}1:{delete_end_letter}1'
+                ).api.EntireColumn.Delete()
+                print(f"   Extra columns deleted")
+            else:
+                print(f"   No extra columns to delete beyond {last_formula_col}")
 
         finally:
             # Re-enable screen updating, auto-calculation, alerts, and events
@@ -1413,17 +1604,19 @@ class ExcelPortfolioAutomation:
 
     def setup_historic_pivot_tables(self, pivot_sheet_name: str, data_sheet_name: str,
                                  big_pivot_name: str, small_pivot_name: str,
-                                 last_month_field: str, last_data_row: int) -> None:
+                                 last_month_field: str, last_data_row: int,
+                                 last_col: str = 'L') -> None:
         """
         Set up pivot tables in Historic PD file after data write.
 
         Steps:
-        1. Delete 'Select PD Category' slicer
-        2. Select E4 (PivotTable2) > Change Data Source to 02.Working
-        3. Select O4 (PivotTable1) > Change Data Source to 02.Working
-        4. Refresh PivotTable2 then PivotTable1
-        5. Select O4 (PivotTable1) > Field List > drag last month to Rows
-        6. Click O4 > filter > untick (blank)
+        1. Delete existing 'Select PD Category' slicer
+        2. PivotTable2 (E4) -> Change Data Source -> select all rows -> OK
+        3. PivotTable1 (O4) -> Change Data Source -> select all rows -> OK
+        4. Refresh both pivots
+        5. PivotTable1 -> drag last_month_field to Rows -> filter out (blank)
+        6. PivotTable2 -> Add PD_CATEGORY slicer
+        7. Slicer Report Connections -> tick PivotTable2 + PivotTable1
         """
         import time
         import win32com.client
@@ -1431,117 +1624,169 @@ class ExcelPortfolioAutomation:
         print(f"\n   Setting up pivot tables in '{pivot_sheet_name}'...")
 
         pivot_sheet = self.workbook.sheets[pivot_sheet_name]
-        source_range = f"'{data_sheet_name}'!$A$2:$S${last_data_row}"
+        source_range = f"'{data_sheet_name}'!$A$2:${last_col}${last_data_row}"
+
+        # Get raw win32com workbook/worksheet objects via xlwings .api
+        # This is the most reliable approach — no GetActiveObject/name-matching needed
+        wb_com    = self.workbook.api
+        excel_com = wb_com.Application
+        ws_com    = wb_com.Worksheets(pivot_sheet_name)
+
+        def _get_field(pt, name):
+            try:
+                return pt.PivotFields(name)
+            except (TypeError, AttributeError):
+                return pt.PivotFields.Item(name)
+
+        def _get_item(pivot_items, idx):
+            try:
+                return pivot_items(idx)
+            except (TypeError, AttributeError):
+                return pivot_items.Item(idx)
 
         try:
             # ====================================================================
-            # Step 1: Delete Select PD Category slicer
+            # Step 1: Delete existing slicers via raw COM (wb_com, not xlwings
+            # wrapper) so Excel fully commits the disconnection before Step 2.
             # ====================================================================
             print(f"   Step 1: Deleting existing slicers...")
             try:
-                while self.workbook.api.SlicerCaches.Count > 0:
-                    self.workbook.api.SlicerCaches(1).Delete()
+                while wb_com.SlicerCaches.Count > 0:
+                    wb_com.SlicerCaches(1).Delete()
                 print(f"     Slicers deleted")
             except Exception as e:
-                print(f"     No slicers to delete: {e}")
+                print(f"     No slicers to delete or error: {e}")
+            time.sleep(2)   # Let Excel fully process the disconnection
 
             # ====================================================================
-            # Step 2: Select E4 (PivotTable2) and change data source
+            # Steps 2+3: Shared cache strategy.
+            #
+            # The problem on Run 2: after Run 1, PivotTable1 and PivotTable2
+            # already share the same cache.  Calling ChangePivotCache on
+            # PivotTable2 while PivotTable1 still holds a reference to the old
+            # shared cache causes "PivotTable field name is not valid" because
+            # Excel tries to reconcile the new column set against PivotTable1's
+            # old field list and fails.
+            #
+            # Solution: delete PivotTable1 FIRST (breaks the shared-cache link),
+            # then safely change PivotTable2's cache, then recreate PivotTable1
+            # from the new shared cache so both are re-linked on the new source.
             # ====================================================================
-            print(f"   Step 2: Selecting E4 ({big_pivot_name}) > Change Data Source...")
-            pivot_sheet.range("E4").select()
-            big_pt = pivot_sheet.api.PivotTables(big_pivot_name)
-            new_cache_big = self.workbook.api.PivotCaches().Create(
-                SourceType=1, SourceData=source_range
-            )
-            big_pt.ChangePivotCache(new_cache_big)
-            print(f"     {big_pivot_name} source updated to {source_range}")
 
-            # ====================================================================
-            # Step 3: Select O4 (PivotTable1) and change data source
-            # ====================================================================
-            print(f"   Step 3: Selecting O4 ({small_pivot_name}) > Change Data Source...")
+            # --- Delete PivotTable1 first (break old shared-cache link) ---
+            print(f"   Step 2a: Removing {small_pivot_name} to break old cache link...")
             pivot_sheet.range("O4").select()
-            small_pt = pivot_sheet.api.PivotTables(small_pivot_name)
-            new_cache_small = self.workbook.api.PivotCaches().Create(
-                SourceType=1, SourceData=source_range
+            try:
+                small_pt_com = ws_com.PivotTables(small_pivot_name)
+                old_row = small_pt_com.TableRange2.Row
+                old_col = small_pt_com.TableRange2.Column
+                small_pt_com.TableRange2.Clear()
+                print(f"     {small_pivot_name} cleared (was at row={old_row} col={old_col})")
+            except Exception as _del_e:
+                # First run — pivot may not exist yet; default position to O4
+                print(f"     {small_pivot_name} not found ({_del_e}), defaulting to row=4 col=15")
+                old_row, old_col = 4, 15
+            time.sleep(1)
+
+            # --- Now safely change PivotTable2's cache ---
+            print(f"   Step 2b: Assigning shared cache to {big_pivot_name}...")
+            big_pt_com = ws_com.PivotTables(big_pivot_name)
+
+            shared_cache = wb_com.PivotCaches().Create(SourceType=1, SourceData=source_range)
+            print(f"     Shared cache created ({source_range})")
+
+            pivot_sheet.range("E4").select()
+            big_pt_com.ChangePivotCache(shared_cache)
+            print(f"     {big_pivot_name} -> shared cache assigned")
+            time.sleep(1)
+
+            # --- Recreate PivotTable1 from the same shared_cache ---
+            print(f"   Step 3: Recreating {small_pivot_name} from shared cache...")
+            target_cell = ws_com.Cells(old_row, old_col)
+            small_pt_com = shared_cache.CreatePivotTable(
+                TableDestination=target_cell,
+                TableName=small_pivot_name
             )
-            small_pt.ChangePivotCache(new_cache_small)
-            print(f"     {small_pivot_name} source updated to {source_range}")
+            print(f"     {small_pivot_name} recreated from shared cache")
+            time.sleep(1)
 
             # ====================================================================
-            # Step 4: Refresh PivotTable2 then PivotTable1
+            # Step 4: Refresh both pivots
             # ====================================================================
             print(f"   Step 4: Refreshing pivots...")
             self.refresh_pivot_table(pivot_sheet_name, big_pivot_name)
             self.refresh_pivot_table(pivot_sheet_name, small_pivot_name)
             print(f"     Both pivots refreshed")
+            time.sleep(2)
 
             # ====================================================================
-            # Use win32com directly for Steps 5-6
-            # (bypasses xlwings COMRetryMethodWrapper that blocks PivotFields)
+            # Step 5: PivotTable1 -> drag last_month_field to Rows
+            #         then filter out (blank) via Filters trick
+            # When 13 months span two years and share a month name
+            # (e.g. Mar 2025 + Mar 2026), Excel creates "Mar" AND "Mar2".
+            # We always want "Mar2" (the most recent duplicate) in Rows.
             # ====================================================================
-            excel_com = win32com.client.GetActiveObject("Excel.Application")
-            ws_com = excel_com.ActiveWorkbook.Worksheets(pivot_sheet_name)
-            small_pt_com = ws_com.PivotTables(small_pivot_name)
-
-            def _get_field(pt, name):
-                try:
-                    return pt.PivotFields(name)
-                except (TypeError, AttributeError):
-                    return pt.PivotFields.Item(name)
-
-            def _get_item(pivot_items, idx):
-                try:
-                    return pivot_items(idx)
-                except (TypeError, AttributeError):
-                    return pivot_items.Item(idx)
-
-            # ====================================================================
-            # Step 5: Select O4 (PivotTable1) > Field List > drag last month
-            #         (e.g. Sep2) to Rows area, then wait 3 seconds
-            # ====================================================================
-            print(f"   Step 5: Adding '{last_month_field}' to {small_pivot_name} Rows...")
+            print(f"   Step 5: Setting up {small_pivot_name} Rows (last month field)...")
             pivot_sheet.range("O4").select()
-            field = _get_field(small_pt_com, last_month_field)
+
+            # 5a. Remove ALL existing row fields so none linger from previous run
+            print(f"     Clearing existing Row fields...")
+            try:
+                while small_pt_com.RowFields.Count > 0:
+                    small_pt_com.RowFields(1).Orientation = 0  # xlHidden
+                print(f"     Row fields cleared")
+            except Exception as _e:
+                print(f"     Note clearing rows: {_e}")
+
+            # 5b. Prefer "fieldname2" (duplicate month) over bare "fieldname"
+            preferred_field_name = last_month_field + "2"
+            try:
+                field = _get_field(small_pt_com, preferred_field_name)
+                print(f"     Detected duplicate month — using '{preferred_field_name}'")
+            except Exception:
+                preferred_field_name = last_month_field
+                field = _get_field(small_pt_com, preferred_field_name)
+                print(f"     Using field '{preferred_field_name}'")
+
+            # 5c. Drag field to Rows
             try:
                 field.Orientation = 1  # xlRowField
-                print(f"     '{last_month_field}' added to Rows")
+                print(f"     '{preferred_field_name}' added to Rows")
             except Exception as e:
-                print(f"     Error adding field: {e}")
+                print(f"     Error adding field to Rows: {e}")
                 import traceback
                 traceback.print_exc()
+
+            # 5c2. Add Count of CONTRACT_NO_NOLASTDIG as the Values field.
+            # Using a DIFFERENT field from the row field avoids Excel moving
+            # the row field to Values when AddDataField is called.
+            try:
+                count_field = _get_field(small_pt_com, "CONTRACT_NO_NOLASTDIG")
+                small_pt_com.AddDataField(count_field, "Count", -4112)  # -4112 = xlCount
+                print(f"     Count (CONTRACT_NO_NOLASTDIG) added to Values")
+            except Exception as _cf:
+                print(f"     WARNING: Could not add Count field: {_cf}")
 
             print(f"     Waiting 3 seconds...")
             time.sleep(3)
 
-            # ====================================================================
-            # Step 6: Filter (blank) out of the small pivot via Filters trick
-            #   6a. Click O4 (PivotTable1)
-            #   6b. Drag Sep2 from Rows → Filters
-            #   6c. Click P2 filter, tick "Select Multiple Items"
-            #   6d. Untick (blank), hit OK
-            #   6e. Drag Sep2 from Filters → back to Rows
-            # ====================================================================
-            print(f"   Step 6: Filtering (blank) via Filters on {small_pivot_name}...")
+            # 5d-5h. Filter (blank) via Filters trick:
+            #   Move field to Filters -> enable multi-select -> untick blank -> move back to Rows
+            print(f"   Filtering (blank) from {small_pivot_name}...")
 
-            # 6a. Click O4
             pivot_sheet.range("O4").select()
             time.sleep(1)
 
-            # 6b. Move Sep2 from Rows to Filters (Page field)
-            print(f"     Moving '{last_month_field}' from Rows to Filters...")
+            print(f"     Moving '{preferred_field_name}' to Filters area...")
             try:
-                field.Orientation = 3  # xlPageField (Filters area)
-                print(f"     '{last_month_field}' moved to Filters")
+                field.Orientation = 3  # xlPageField
+                print(f"     Moved to Filters")
             except Exception as e:
                 print(f"     Error moving to Filters: {e}")
                 import traceback
                 traceback.print_exc()
             time.sleep(1)
 
-            # 6c. Click P2 (filter dropdown) and enable Select Multiple Items
-            print(f"     Enabling Select Multiple Items...")
             pivot_sheet.range("P2").select()
             try:
                 field.EnableMultiplePageItems = True
@@ -1552,7 +1797,6 @@ class ExcelPortfolioAutomation:
                 traceback.print_exc()
             time.sleep(1)
 
-            # 6d. Untick (blank) from items: 1, 2, 3, 4, 5, (blank)
             print(f"     Unticking (blank)...")
             try:
                 try:
@@ -1560,7 +1804,7 @@ class ExcelPortfolioAutomation:
                 except TypeError:
                     pi_items = field.PivotItems
                 item_count = pi_items.Count
-                print(f"     '{last_month_field}' has {item_count} items")
+                print(f"     '{preferred_field_name}' has {item_count} items")
 
                 blank_hidden = False
                 for i in range(1, item_count + 1):
@@ -1569,13 +1813,12 @@ class ExcelPortfolioAutomation:
                         name = str(pi.Name)
                         print(f"       Item {i}: '{name}'")
                         if name.lower() in ['(blank)', 'blank', '']:
-                            print(f"     >>> Unticked: '{name}'")
                             pi.Visible = False
                             blank_hidden = True
+                            print(f"     >>> Unticked: '{name}'")
                     except Exception as e:
                         print(f"       Error with item {i}: {e}")
 
-                # Fallback: blank is typically the last item
                 if not blank_hidden and item_count > 1:
                     try:
                         pi = _get_item(pi_items, item_count)
@@ -1585,43 +1828,57 @@ class ExcelPortfolioAutomation:
                         print(f"     Fallback failed: {e}")
 
                 print(f"     (blank) unticked")
-
             except Exception as e:
                 print(f"     ERROR unticking (blank): {e}")
                 import traceback
                 traceback.print_exc()
             time.sleep(1)
 
-            # 6e. Move Sep2 from Filters back to Rows
-            print(f"     Moving '{last_month_field}' from Filters back to Rows...")
+            print(f"     Moving '{preferred_field_name}' back to Rows...")
             try:
                 field.Orientation = 1  # xlRowField
-                print(f"     '{last_month_field}' back in Rows")
+                print(f"     '{preferred_field_name}' back in Rows")
             except Exception as e:
                 print(f"     Error moving back to Rows: {e}")
                 import traceback
                 traceback.print_exc()
             time.sleep(1)
 
+
             # ====================================================================
-            # Step 7: Click big pivot > Insert Slicer > tick PD_CATEGORY
-            #         Move slicer next to big pivot
+            # Step 6: PivotTable2 -> Insert Slicer -> PD_CATEGORY
+            # Use raw win32com (wb_com / ws_com) throughout so AddPivotTable
+            # receives the same COM type as small_pt_com — no xlwings mismatch.
             # ====================================================================
-            print(f"   Step 7: Adding PD_CATEGORY slicer to {big_pivot_name}...")
+            print(f"   Step 6: Adding PD_CATEGORY slicer to {big_pivot_name}...")
             pivot_sheet.range("E4").select()
             try:
-                slicer_cache = self.workbook.api.SlicerCaches.Add2(big_pt, "PD_CATEGORY")
-                slicer = slicer_cache.Slicers.Add(pivot_sheet.api)
-                slicer.Caption = "Select PD Category"
+                big_pt_com2 = ws_com.PivotTables(big_pivot_name)
+                slicer_cache_com = wb_com.SlicerCaches.Add2(big_pt_com2, "PD_CATEGORY")
+                slicer_com = slicer_cache_com.Slicers.Add(ws_com)
+                slicer_com.Caption = "Select PD Category"
 
-                # Position slicer next to the big pivot (to its right)
-                big_pt_range = big_pt.TableRange2
-                slicer.Width = 144
-                slicer.Height = 200
-                slicer.Left = big_pt_range.Left + big_pt_range.Width + 10
-                slicer.Top = big_pt_range.Top
+                # Position slicer to the right of the big pivot
+                big_pt_range = big_pt_com2.TableRange2
+                slicer_com.Width = 144
+                slicer_com.Height = 200
+                slicer_com.Left = big_pt_range.Left + big_pt_range.Width + 10
+                slicer_com.Top = big_pt_range.Top
+                print(f"     Slicer added to {big_pivot_name}")
 
-                print(f"     PD_CATEGORY slicer added next to {big_pivot_name}")
+                # ================================================================
+                # Step 7: Report Connections -> tick PivotTable2 + PivotTable1
+                # Both objects are raw win32com — no type mismatch.
+                # ================================================================
+                print(f"   Step 7: Connecting slicer to {small_pivot_name} via Report Connections...")
+                try:
+                    small_pt_com2 = ws_com.PivotTables(small_pivot_name)
+                    slicer_cache_com.PivotTables.AddPivotTable(small_pt_com2)
+                    print(f"     Slicer connected to {small_pivot_name}")
+                except Exception as _se:
+                    print(f"     WARNING: Could not connect slicer to {small_pivot_name}: {_se}")
+
+                print(f"     PD_CATEGORY slicer connected to both pivot tables")
 
             except Exception as e:
                 print(f"     ERROR adding slicer: {e}")
@@ -1645,37 +1902,43 @@ class ExcelPortfolioAutomation:
                               historic_sheet: str = "02.Working") -> str:
         """
         Complete workflow to copy pivot data to historic PD format.
-        
+
+        Run 1: pivot has 7 months (Portfolio_1 only) — written directly.
+        Run 2: pivot has 13 months (both portfolios combined) — written directly.
+        No merging needed; the big pivot already combines both portfolios.
+
         Args:
             latest_pd_file: Path to the latest PD file with pivot data
             input_folder: Folder containing the original historic file
             output_folder: Folder to save the updated historic file
-            historic_filename: Name of the historic file (default: "02. Historic PD Calculation 2024-25.xlsb")
-            pivot_sheet: Sheet name with pivot data (default: "01.Pivoted_Portfolio")
-            historic_sheet: Sheet name to write historic format (default: "02.Working")
-        
+            historic_filename: Name of the historic file
+            pivot_sheet: Sheet name with pivot data
+            historic_sheet: Sheet name to write historic format
+
         Returns:
             str: Path to the saved historic file
         """
         print("\n" + "="*80)
         print("COPYING PIVOT TO HISTORIC PD FORMAT")
         print("="*80)
-        
+
         historic_input_file = os.path.join(input_folder, historic_filename)
-        
+
         # Step 1: Extract pivot data from latest PD file
         print(f"\n1. Opening PD file to extract pivot...")
         print(f"   File: {os.path.basename(latest_pd_file)}")
-        
+
         with ExcelPortfolioAutomation(latest_pd_file, visible=True) as excel:
             pivot_df = excel.extract_pivot_table_to_dataframe(pivot_sheet)
-            
+
             if pivot_df.empty:
                 print("\n   ERROR: No pivot data extracted!")
                 return None
-        
-        print(f"   Extracted pivot data: {len(pivot_df)} rows")
-        
+
+        date_col_count = len([c for c in pivot_df.columns
+                               if c not in ['CONTRACT_NO_NOLASTDIG', 'PD_CATEGORY']])
+        print(f"   Extracted pivot data: {len(pivot_df)} rows x {date_col_count} date cols")
+
         # Step 2: Open historic file and write data
         print(f"\n2. Opening Historic PD file...")
         print(f"   File: {os.path.basename(historic_input_file)}")
@@ -1695,8 +1958,13 @@ class ExcelPortfolioAutomation:
             month_num = int(last_date.split('-')[1])
             month_names_list = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
                                'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-            last_month_field = f"{month_names_list[month_num - 1]}2"  # e.g., 'Sep2'
+            last_month_field = month_names_list[month_num - 1]  # e.g., 'Sep'
             last_data_row = 3 + len(pivot_df) - 1  # data starts at row 3
+
+            # Last column with data = first data col (C=3) + date cols + 4 formula cols - 1
+            # For 6 months: 3 + 6 + 4 - 1 = 12 = 'L'
+            last_col_num    = 3 + len(date_columns) + 4 - 1
+            last_col_letter = excel._col_number_to_letter(last_col_num)
 
             excel.setup_historic_pivot_tables(
                 pivot_sheet_name="03.PD_Pivot",
@@ -1704,7 +1972,8 @@ class ExcelPortfolioAutomation:
                 big_pivot_name="PivotTable2",
                 small_pivot_name="PivotTable1",
                 last_month_field=last_month_field,
-                last_data_row=last_data_row
+                last_data_row=last_data_row,
+                last_col=last_col_letter
             )
 
             # Save as new file with timestamp
